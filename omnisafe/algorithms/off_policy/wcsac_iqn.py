@@ -187,3 +187,138 @@ class WCSAC_IQN(WCSAC):
                 'Value/cost_critic': current_quantiles.mean().item(),
             },
         )
+
+    # ==================== CVaR 采样计算 ====================
+
+    def _compute_cvar(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate CVaR_alpha by sampling tau ~ U(0, alpha).
+
+        CVaR_alpha = (1/alpha) * integral_{0}^{alpha} Z(tau) d tau
+                   ≈ (1/K) * sum_{k=1}^{K} Z(tau_k),  tau_k ~ U(0, alpha)
+
+        Args:
+            obs: Observation tensor of shape ``[B, obs_dim]``.
+            act: Action tensor of shape ``[B, act_dim]``.
+
+        Returns:
+            CVaR estimate of shape ``[B, 1]``.
+        """
+        batch_size = obs.shape[0]
+        cvar_samples = self._cfgs.algo_cfgs.get('cvar_quantile_samples', 32)
+        alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+        device = obs.device
+
+        tau_cvar = torch.rand(batch_size, cvar_samples, device=device) * alpha
+
+        quantiles = self._actor_critic.cost_critic(obs, act, tau_cvar)  # [B, K, 1]
+        cvar = quantiles.mean(dim=1)  # [B, 1]
+
+        return cvar
+
+    # ==================== Actor Loss ====================
+
+    def _loss_pi(self, obs: torch.Tensor) -> torch.Tensor:
+        r"""Compute actor loss for WCSAC-IQN.
+
+        L = E[ alpha * log pi(a|s) - min(Qr1, Qr2)(s,a) + lambda * CVaR(s,a) ]
+
+        where CVaR is estimated by sampling quantile fractions from U(0, alpha).
+        """
+        action = self._actor_critic.actor.predict(obs, deterministic=False)
+        log_prob = self._actor_critic.actor.log_prob(action)
+
+        q1_value_r, q2_value_r = self._actor_critic.reward_critic(obs, action)
+        loss_entropy = self._alpha * log_prob
+        loss_reward = -torch.min(q1_value_r, q2_value_r)
+
+        loss_cost = torch.zeros_like(loss_reward)
+
+        if self._cfgs.algo_cfgs.use_cost:
+            cvar = self._compute_cvar(obs, action)
+
+            if torch.isfinite(cvar).all():
+                loss_cost = self._lagrange_multiplier * cvar.squeeze(-1)
+
+        total_loss = (loss_entropy + loss_reward + loss_cost).mean()
+
+        return total_loss
+
+    # ==================== Lagrange 乘子更新 ====================
+
+    def _update_lagrange_multiplier_wccvar(self, obs: torch.Tensor) -> None:
+        """Update Lagrange multiplier based on CVaR constraint violation.
+
+        Uses sampled CVaR from IQN critic (instead of closed-form Gaussian CVaR).
+        """
+        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
+        lambda_lr = float(self._cfgs.lagrange_cfgs.lambda_lr)
+
+        with torch.no_grad():
+            action = self._actor_critic.actor.predict(obs, deterministic=False)
+            cvar = self._compute_cvar(obs, action)
+
+            if not torch.isfinite(cvar).all():
+                self._logger.store(
+                    {
+                        'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
+                        'Value/wccvar': 0.0,
+                    },
+                )
+                return
+
+            if cvar.dim() == 2:
+                cvar = cvar.squeeze(-1)
+
+            J = cvar.mean()
+            gap = J - cost_limit
+
+            self._lagrange_multiplier = torch.clamp(
+                self._lagrange_multiplier + lambda_lr * gap,
+                min=0.0,
+                max=self._LAMBDA_MAX,
+            )
+
+            self._logger.store(
+                {
+                    'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
+                    'Value/wccvar': J.item(),
+                },
+            )
+
+    def _log_lagrange_when_warmup(self, obs: torch.Tensor) -> None:
+        """Log Lagrange-related metrics during warmup (without updating lambda)."""
+        with torch.no_grad():
+            action = self._actor_critic.actor.predict(obs, deterministic=False)
+
+            cvar_val = 0.0
+            try:
+                cvar = self._compute_cvar(obs, action)
+                if torch.isfinite(cvar).all():
+                    cvar_val = cvar.mean().item()
+            except Exception:
+                pass
+
+            self._logger.store(
+                {
+                    'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
+                    'Value/wccvar': cvar_val,
+                },
+            )
+
+    # ==================== 日志 ====================
+
+    def _init_log(self) -> None:
+        """Register logging keys. Overrides WCSAC to keep compatible keys."""
+        super()._init_log()
+        # 父类 WCSAC._init_log 注册了 wccvar, lagrange_multiplier, cost_mean, cost_var
+        # IQN 不使用 cost_mean/cost_var（高斯专用），但注册了也不影响运行
+
+    def _log_when_not_update(self) -> None:
+        """Log default values when not updating."""
+        super()._log_when_not_update()
+        # 父类 WCSAC._log_when_not_update 已注册了 wccvar, lagrange_multiplier,
+        # cost_mean, cost_var 的默认值
