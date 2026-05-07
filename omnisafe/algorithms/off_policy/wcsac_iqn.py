@@ -104,7 +104,7 @@ class WCSAC_IQN(WCSAC):
         # 分位数权重: |tau - I(delta < 0)|
         quantile_weight = (tau_expanded - (td_error.detach() < 0).float()).abs()
 
-        return (quantile_weight * huber).mean()
+        return (quantile_weight * huber).mean() / kappa
 
     # ==================== Cost Critic 更新 ====================
 
@@ -154,6 +154,9 @@ class WCSAC_IQN(WCSAC):
         current_quantiles = self._actor_critic.cost_critic(
             obs, action, tau
         )  # [B, N, 1]
+
+        if not torch.isfinite(current_quantiles).all():
+            raise RuntimeError('cost_critic outputs NaN/Inf')
 
         # 构建 TD error: delta_{i,j} = target_j - current_i
         # target: [B, N', 1] -> [B, 1, N']; current: [B, N, 1]
