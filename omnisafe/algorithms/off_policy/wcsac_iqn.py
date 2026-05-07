@@ -295,12 +295,9 @@ class WCSAC_IQN(WCSAC):
             action = self._actor_critic.actor.predict(obs, deterministic=False)
 
             cvar_val = 0.0
-            try:
-                cvar = self._compute_cvar(obs, action)
-                if torch.isfinite(cvar).all():
-                    cvar_val = cvar.mean().item()
-            except Exception:
-                pass
+            cvar = self._compute_cvar(obs, action)
+            if torch.isfinite(cvar).all():
+                cvar_val = cvar.mean().item()
 
             self._logger.store(
                 {
