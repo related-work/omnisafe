@@ -26,6 +26,11 @@ from omnisafe.algorithms.off_policy.td3_lag import TD3Lag
 from omnisafe.algorithms.off_policy.td3_pid import TD3PID
 
 
+from omnisafe.algorithms.off_policy.sac_lag_1 import SACLag_1
+from omnisafe.algorithms.off_policy.dcddpg import DCDDPG
+from omnisafe.algorithms.off_policy.dcsac import DCSAC
+from omnisafe.algorithms.off_policy.wcsac import WCSAC
+from omnisafe.algorithms.off_policy.wcsac_iqn import WCSAC_IQN
 __all__ = [
     'DDPG',
     'TD3',
@@ -37,4 +42,9 @@ __all__ = [
     'TD3PID',
     'SACPID',
     'CRABS',
+    'SACLag_1',
+    'DCDDPG',
+    "DCSAC",
+    "WCSAC",
+    "WCSAC_IQN",
 ]
