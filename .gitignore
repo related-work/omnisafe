@@ -9,6 +9,7 @@ benchmarks/
 images/
 omnisafe.egg-info/
 docs/superpowers/
+.github/workflows/
 *copy.py
 *.log
 
