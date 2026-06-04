@@ -19,13 +19,13 @@ from torch import nn, optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
 from omnisafe.algorithms import registry
-from omnisafe.algorithms.off_policy.ddpg import DDPG
+from omnisafe.algorithms.off_policy.ddpg_1 import DDPG_1
 from omnisafe.models.actor_critic.constraint_actor_q_critic import ConstraintActorQCritic
 
 
 @registry.register
 # pylint: disable-next=too-many-instance-attributes,too-few-public-methods
-class SAC(DDPG):
+class SAC_1(DDPG_1):
     """The Soft Actor-Critic (SAC) algorithm.
 
     References:

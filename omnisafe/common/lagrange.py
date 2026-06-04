@@ -78,6 +78,7 @@ class Lagrange:
         self.lagrangian_upper_bound: float | None = lagrangian_upper_bound
 
         init_value = max(lagrangian_multiplier_init, 0.0)
+        # 说明 λ 是一个“可学习的参数”
         self.lagrangian_multiplier: torch.nn.Parameter = torch.nn.Parameter(
             torch.as_tensor(init_value),
             requires_grad=True,
@@ -88,6 +89,8 @@ class Lagrange:
             torch.optim,
             lambda_optimizer,
         ), f'Optimizer={lambda_optimizer} not found in torch.'
+       
+        #  getattr(torch.optim, "Adam")，就是从 torch.optim 里“拿出 Adam 这个类”。
         torch_opt = getattr(torch.optim, lambda_optimizer)
         self.lambda_optimizer: torch.optim.Optimizer = torch_opt(
             [

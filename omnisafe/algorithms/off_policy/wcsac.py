@@ -51,6 +51,7 @@ class WCSAC(SAC):
 
     _lagrange_multiplier: torch.Tensor
     _pdf_cdf: float  # CVaR 系数: phi(Phi^{-1}(alpha)) / (1 - alpha)
+    _damp: float  # 阻尼项, 基于 real actions 的 CVaR 与 cost_limit 的差值
 
     def _init_model(self) -> None:
         """Initialize the model.
@@ -90,6 +91,9 @@ class WCSAC(SAC):
         phi_z_alpha = torch.exp(normal.log_prob(z_alpha))
         self._pdf_cdf = (phi_z_alpha / (1.0 - alpha)).item()
 
+        # 阻尼项，基于 real actions 的 CVaR 与 cost_limit 的差值
+        self._damp = 0.0
+
     def _init_log(self) -> None:
         """Register logging keys for WCSAC-specific metrics."""
         super()._init_log()
@@ -98,6 +102,7 @@ class WCSAC(SAC):
         self._logger.register_key('Value/lagrange_multiplier')
         self._logger.register_key('Value/cost_mean')
         self._logger.register_key('Value/cost_var')
+        self._logger.register_key('Value/damp')
 
     # ==================== Gaussian 分布工具函数 ====================
 
@@ -236,6 +241,12 @@ class WCSAC(SAC):
         # L_var = 0.5 * E[var + target_var - 2 * sqrt(var * target_var)]
         loss_var = 0.5 * (var + target_var - 2 * torch.sqrt(var * target_var)).mean()
 
+        # 计算阻尼项 (基于 real actions 的 CVaR 与 cost_limit 的差值)
+        damp_scale = float(self._cfgs.algo_cfgs.get('damp_scale', 10.0))
+        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
+        cvar_real = self._gaussian_cvar(mu.detach(), var.detach())
+        self._damp = damp_scale * (cost_limit - cvar_real.mean()).item()
+
         loss = loss_mu + loss_var
 
         if self._cfgs.algo_cfgs.use_critic_norm:
@@ -258,6 +269,7 @@ class WCSAC(SAC):
                 'Value/cost_critic': mu.mean().item(),
                 'Value/cost_mean': mu.mean().item(),
                 'Value/cost_var': var.mean().item(),
+                'Value/damp': self._damp,
             },
         )
 
@@ -290,7 +302,7 @@ class WCSAC(SAC):
                 cvar = self._gaussian_cvar(mu, var)
 
                 if torch.isfinite(cvar).all():
-                    loss_cost = self._lagrange_multiplier * cvar
+                    loss_cost = (self._lagrange_multiplier - self._damp) * cvar
 
         total_loss = (loss_entropy + loss_reward + loss_cost).mean()
 
@@ -385,5 +397,6 @@ class WCSAC(SAC):
                 'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
                 'Value/cost_mean': 0.0,
                 'Value/cost_var': 0.0,
+                'Value/damp': 0.0,
             },
         )

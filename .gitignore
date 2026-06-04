@@ -1,6 +1,16 @@
 ##### Project Specification #####
 **/runs
 **/exp-x
+train/
+research_runs/
+examples/
+tutorials/
+benchmarks/
+images/
+omnisafe.egg-info/
+docs/superpowers/
+*copy.py
+*.log
 
 ##### Python.gitignore #####
 # Byte-compiled / optimized / DLL files

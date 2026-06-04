@@ -1,39 +1,27 @@
-# Copyright 2023 OmniSafe Team. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Implementation of the Deep Deterministic Policy Gradient algorithm."""
-
 from __future__ import annotations
 
-import time
-from typing import Any
 
+from typing import Any
+import os, time
 import torch
 from torch import nn
 from torch.nn.utils.clip_grad import clip_grad_norm_
+import torch.nn.functional as F
+from torch.distributions import Normal
 
-from omnisafe.adapter import OffPolicyAdapter
+# from omnisafe.adapter.offpolicy_adapter_1 import OffPolicyAdapter_1
+from omnisafe.adapter.offpolicy_adapter import OffPolicyAdapter
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.base_algo import BaseAlgo
-from omnisafe.common.buffer import VectorOffPolicyBuffer
+# from omnisafe.common.buffer.vector_offpolicy_buffer_1 import VectorOffPolicyBuffer_1  #1111
+from omnisafe.common.buffer.vector_offpolicy_buffer import VectorOffPolicyBuffer 
 from omnisafe.common.logger import Logger
-from omnisafe.models.actor_critic.constraint_actor_q_critic import ConstraintActorQCritic
+from omnisafe.models.actor_critic.disconstraint_actor_q_critic import DisConstraintActorQCritic
 
 
 @registry.register
 # pylint: disable-next=too-many-instance-attributes,too-few-public-methods
-class DDPG(BaseAlgo):
+class DCDDPG(BaseAlgo):
     """The Deep Deterministic Policy Gradient (DDPG) algorithm.
 
     References:
@@ -44,7 +32,7 @@ class DDPG(BaseAlgo):
     """
 
     _epoch: int
-
+ 
     def _init_env(self) -> None:
         """Initialize the environment.
 
@@ -110,7 +98,7 @@ class DDPG(BaseAlgo):
             ...     self._actor_critic = CustomActorQCritic()
         """
         self._cfgs.model_cfgs.critic['num_critics'] = 1
-        self._actor_critic: ConstraintActorQCritic = ConstraintActorQCritic(
+        self._actor_critic: DisConstraintActorQCritic = DisConstraintActorQCritic(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
             model_cfgs=self._cfgs.model_cfgs,
@@ -137,6 +125,34 @@ class DDPG(BaseAlgo):
             penalty_coefficient=self._cfgs.algo_cfgs.get('penalty_coefficient', 0.0),
             device=self._device,
         )
+        
+        self._lagrange_update_count = 0
+        self._lagrange_multiplier = torch.tensor(
+        float(self._cfgs.lagrange_cfgs.lagrangian_multiplier_init),
+        device=self._device,
+    )
+
+        self.lambda_max=1000.0
+        self.lambda_delta_max=100.0
+        #   # === 方案B：存元数据 ===
+        # self._buf.add_field('env_id', (), torch.int64)
+        # self._buf.add_field('env_step', (), torch.int64)
+        
+        # # 111
+        # import datetime as dt
+        # ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # qc_dir = os.path.join(self._cfgs.logger_cfgs.log_dir, self._cfgs.exp_name)
+        # os.makedirs(qc_dir, exist_ok=True)
+        # self._qc_tgt_sampled_path = os.path.join(qc_dir, f"qc_target_sampled_{self._env_id}_{ts}.csv")
+        # if not os.path.exists(self._qc_tgt_sampled_path):
+        #     with open(self._qc_tgt_sampled_path, "w") as f:
+        #         f.write("env_step,env_id,q_c_target\n")
+                
+                
+        # self._qc_flush_every = 10000 # sampled 的量更大，建议更大一点
+        # self._qc_tgt_sampled_lines: list[str] = []
+
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -241,6 +257,9 @@ class DDPG(BaseAlgo):
         # log information about critic
         self._logger.register_key('Loss/Loss_reward_critic', delta=True)
         self._logger.register_key('Value/reward_critic')
+        self._logger.register_key('Value/cost_mu_log')
+        self._logger.register_key('Value/cost_std_log')
+
 
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
@@ -253,9 +272,16 @@ class DDPG(BaseAlgo):
         self._logger.register_key('Time/Evaluate')
         self._logger.register_key('Time/Epoch')
         self._logger.register_key('Time/FPS')
+        
+        
+        self._logger.register_key('Value/lagrange_multiplier')
+        self._logger.register_key('Value/wccvar')
+        self._logger.register_key('Value/lambda_delta')
+
+
         # register environment specific keys
         for env_spec_key in self._env.env_spec_keys:
-            self.logger.register_key(env_spec_key)
+            self._logger.register_key(env_spec_key)
 
     def learn(self) -> tuple[float, float, float]:
         """This is main function for algorithm update.
@@ -304,6 +330,7 @@ class DDPG(BaseAlgo):
                 # update parameters
                 update_start = time.time()
                 if step > self._cfgs.algo_cfgs.start_learning_steps:
+                    
                     self._update()
                 # if we haven't updated the network, log 0 for the loss
                 else:
@@ -348,9 +375,24 @@ class DDPG(BaseAlgo):
         ep_ret = self._logger.get_stats('Metrics/EpRet')[0]
         ep_cost = self._logger.get_stats('Metrics/EpCost')[0]
         ep_len = self._logger.get_stats('Metrics/EpLen')[0]
-        self._logger.close()
-        self._env.close()
+        
+        
+        # # flush adapter qc logs
+        # if hasattr(self._env, "flush_qc_logs"):
+        #     self._env.flush_qc_logs()
 
+        # # flush sampled qc-target logs
+        # if hasattr(self, "_qc_tgt_sampled_lines") and len(self._qc_tgt_sampled_lines) > 0:
+        #     with open(self._qc_tgt_sampled_path, "a") as f:
+        #         f.writelines(self._qc_tgt_sampled_lines)
+                
+        #     self._qc_tgt_sampled_lines.clear()
+        
+        # if hasattr(self._env, "flush_qc_logs"):
+        #     self._env.flush_qc_logs()
+
+        self._env.close()
+        self._logger.close()
         return ep_ret, ep_cost, ep_len
 
     def _update(self) -> None:
@@ -388,18 +430,24 @@ class DDPG(BaseAlgo):
         for _ in range(self._cfgs.algo_cfgs.update_iters):
             data = self._buf.sample_batch()
             self._update_count += 1
-            obs, act, reward, cost, done, next_obs = (
-                data['obs'],
-                data['act'],
-                data['reward'],
-                data['cost'],
-                data['done'],
-                data['next_obs'],
-            )
+ 
+            obs = data['obs']
+            act = data['act']
+            reward = data['reward']
+            cost = data['cost']
+            done = data['done']
+            next_obs = data['next_obs']
 
+            
+      
             self._update_reward_critic(obs, act, reward, done, next_obs)
             if self._cfgs.algo_cfgs.use_cost:
-                self._update_cost_critic(obs, act, cost, done, next_obs)
+                # self._update_cost_critic(obs, act, cost, done, next_obs)
+                self._update_cost_critic(obs, act, cost, done, next_obs,)
+                if self._epoch > self._cfgs.algo_cfgs.warmup_epochs:
+                    self._update_lagrange_multiplier_wccvar(obs)
+          
+                
 
             if self._update_count % self._cfgs.algo_cfgs.policy_delay == 0: #每做 policy_delay 次 mini-batch 更新，才更新一次 actor
                 self._update_actor(obs)
@@ -426,6 +474,8 @@ class DDPG(BaseAlgo):
             done (torch.Tensor): The ``terminated`` sampled from buffer.
             next_obs (torch.Tensor): The ``next observation`` sampled from buffer.
         """
+
+
         with torch.no_grad():
             next_action = self._actor_critic.actor.predict(next_obs, deterministic=True)
             next_q_value_r = self._actor_critic.target_reward_critic(next_obs, next_action)[0]
@@ -452,6 +502,46 @@ class DDPG(BaseAlgo):
             )
         self._actor_critic.reward_critic_optimizer.step()
 
+
+
+    def _get_cost_dist_params(self,cost_critic, obs, act):
+        q2 = cost_critic(obs, act)[0]   # [B,2]
+        mu_log  = q2[:, 0:1]            # [B,1]
+        std_raw = q2[:, 1:2]            # [B,1]
+        std_log = F.softplus(std_raw) + 1e-6
+        return mu_log, std_log
+    
+    def _lognormal_mean(self,mu_log: torch.Tensor, std_log: torch.Tensor) -> torch.Tensor:
+        # E[X] = exp(mu + 0.5*sigma^2) - 1
+        x = mu_log + 0.5 * std_log.pow(2)
+        x = torch.clamp(x, -10.0, 10.0)  # 数值稳定
+        return torch.exp(x) - 1.0
+    
+    def _lognormal_cvar(self, mu_log: torch.Tensor, std_log: torch.Tensor, alpha: float) -> torch.Tensor:
+        """LogNormal CVaR：与 numpy/scipy 逻辑一致
+        z_alpha = ppf(alpha)
+        E_X_plus_1 = exp(clip(mu + std^2/2, -10, 10))
+        cvar_shifted = E_X_plus_1 * cdf(std - z_alpha) / (1-alpha)
+        return cvar_shifted - 1
+        """
+        normal = torch.distributions.Normal(
+            loc=torch.tensor(0.0, device=mu_log.device, dtype=mu_log.dtype),
+            scale=torch.tensor(1.0, device=mu_log.device, dtype=mu_log.dtype),
+        )
+
+        # z_alpha = scipy_norm.ppf(alpha)
+        z_alpha = normal.icdf(torch.tensor(alpha, device=mu_log.device, dtype=mu_log.dtype))
+
+        # E_X_plus_1 = exp(clip(mu + std^2/2, -10, 10))
+        E_X_plus_1 = torch.exp(torch.clamp(mu_log + std_log.pow(2) / 2.0, -10.0, 10.0))
+
+        # scipy_norm.cdf(std_log - z_alpha)
+        cdf_term = normal.cdf(std_log - z_alpha)
+        cvar_shifted = E_X_plus_1 * cdf_term / (1.0 - alpha)
+        return cvar_shifted - 1.0
+
+    
+    
     def _update_cost_critic(
         self,
         obs: torch.Tensor,
@@ -459,6 +549,7 @@ class DDPG(BaseAlgo):
         cost: torch.Tensor,
         done: torch.Tensor,
         next_obs: torch.Tensor,
+      
     ) -> None:
         """Update cost critic.
 
@@ -473,12 +564,30 @@ class DDPG(BaseAlgo):
             done (torch.Tensor): The ``terminated`` sampled from buffer.
             next_obs (torch.Tensor): The ``next observation`` sampled from buffer.
         """
+        if cost.dim() == 1:
+            cost = cost.unsqueeze(-1)
+        if done.dim() == 1:
+            done = done.unsqueeze(-1)
         with torch.no_grad():
             next_action = self._actor_critic.actor.predict(next_obs, deterministic=True)
-            next_q_value_c = self._actor_critic.target_cost_critic(next_obs, next_action)[0]
-            target_q_value_c = cost + self._cfgs.algo_cfgs.gamma * (1 - done) * next_q_value_c
-        q_value_c = self._actor_critic.cost_critic(obs, action)[0]
-        loss = nn.functional.mse_loss(q_value_c, target_q_value_c)
+            # next_q_value_c = self._actor_critic.target_cost_critic(next_obs, next_action)[0]
+            # target_q_value_c = cost + self._cfgs.algo_cfgs.gamma * (1 - done) * next_q_value_c
+            next_mu_log, next_std_log = self._get_cost_dist_params(self._actor_critic.target_cost_critic, next_obs, next_action)
+            
+            next_mean = self._lognormal_mean(next_mu_log, next_std_log)  # [B,1]
+            target_c = cost + self._cfgs.algo_cfgs.gamma * (1 - done) * next_mean
+            target_c = torch.clamp(target_c, min=0.0)          # cost-return 应 >=0
+            target_log = torch.log(target_c + 1.0)             # 对齐 lognormal: X+1
+        mu_log, std_log = self._get_cost_dist_params(self._actor_critic.cost_critic, obs, action)
+          
+        if not torch.isfinite(mu_log).all() or not torch.isfinite(std_log).all():
+            raise RuntimeError("cost_critic outputs NaN/Inf")
+
+        dist = Normal(mu_log, std_log)
+        loss = -dist.log_prob(target_log).mean()
+        
+        # q_value_c = self._actor_critic.cost_critic(obs, action)[0]
+        # loss = nn.functional.mse_loss(q_value_c, target_q_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.cost_critic.parameters():
@@ -493,11 +602,16 @@ class DDPG(BaseAlgo):
                 self._cfgs.algo_cfgs.max_grad_norm,
             )
         self._actor_critic.cost_critic_optimizer.step()
-
+        
+        with torch.no_grad():
+            pred_mean = self._lognormal_mean(mu_log, std_log)  # [B,1]
+            
         self._logger.store(
             {
                 'Loss/Loss_cost_critic': loss.mean().item(),
-                'Value/cost_critic': q_value_c.mean().item(),
+                'Value/cost_critic': pred_mean.mean().item(),
+                'Value/cost_mu_log': float(mu_log.mean().item()),
+                'Value/cost_std_log': float(std_log.mean().item()),
             },
         )
 
@@ -533,7 +647,7 @@ class DDPG(BaseAlgo):
         self,
         obs: torch.Tensor,
     ) -> torch.Tensor:
-        r"""Computing ``pi/actor`` loss.
+        """Computing ``pi/actor`` loss.
 
         The loss function in DDPG is defined as:
 
@@ -550,7 +664,27 @@ class DDPG(BaseAlgo):
             The loss of pi/actor.
         """
         action = self._actor_critic.actor.predict(obs, deterministic=True)
-        return -self._actor_critic.reward_critic(obs, action)[0].mean()
+        q_r = self._actor_critic.reward_critic(obs, action)[0]
+        loss_r = -q_r.mean()
+
+        if not self._cfgs.algo_cfgs.use_cost:
+            return loss_r
+
+        
+        alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+
+        mu_log, std_log = self._get_cost_dist_params(self._actor_critic.cost_critic, obs, action)
+        if (not torch.isfinite(mu_log).all()) or (not torch.isfinite(std_log).all()):
+            return loss_r
+        wccvar = self._lognormal_cvar(mu_log, std_log, alpha)
+
+        if not torch.isfinite(wccvar).all():
+            return loss_r
+        loss_c = self._lagrange_multiplier * wccvar.mean()
+
+        # 可选：防止 λ 很大时 loss 尺度太大（ddpg-lag 常见技巧）
+        denom = (1.0 + self._lagrange_multiplier).detach()
+        return (loss_r + loss_c) / denom
 
     def _log_when_not_update(self) -> None:
         """Log default value when not update."""
@@ -568,3 +702,111 @@ class DDPG(BaseAlgo):
                     'Value/cost_critic': 0.0,
                 },
             )
+            self._logger.store({
+            'Value/cost_mu_log': 0.0,
+            'Value/cost_std_log': 0.0,
+            'Value/lagrange_multiplier': float(self._lagrange_multiplier.item()),
+            'Value/wccvar': 0.0,
+
+        })
+
+    def _update_lagrange_multiplier_wccvar(self, obs: torch.Tensor) -> None:
+        alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
+        lambda_lr = float(self._cfgs.lagrange_cfgs.lambda_lr)
+
+        # 你已经在类里写死 self.lambda_max=1000.0
+        lambda_max = float(self.lambda_max)
+
+        # 你需要新增一个“单次最大更新幅度”，建议也写成成员变量（或 cfg）
+        # 例如在 _init 里： self.lambda_delta_max = 1.0
+        delta_max = float(self.lambda_delta_max)
+
+        with torch.no_grad():
+            # 用当前策略动作 π(s)
+            act_pi = self._actor_critic.actor.predict(obs, deterministic=True)
+
+            # ✅ 用当前 cost_critic（不是 target）
+            mu_log, std_log = self._get_cost_dist_params(self._actor_critic.cost_critic, obs, act_pi)
+
+            # 数值保护（建议保留，不然你很难挡住 critic 一次发散把 λ 污染）
+            if not torch.isfinite(mu_log).all() or not torch.isfinite(std_log).all():
+                return
+
+            wccvar = self._lognormal_cvar(mu_log, std_log, alpha)  # [B,1] 或 [B]
+            if wccvar.dim() == 2:
+                wccvar = wccvar.squeeze(-1)
+
+            if not torch.isfinite(wccvar).all():
+                return
+
+            J = wccvar.mean()              # scalar
+            gap = J - cost_limit           # scalar
+
+            # 原始梯度上升步长：Δλ = lr * gap
+            delta = lambda_lr * gap
+
+            # ✅ 限制单次更新最大幅度：|Δλ| <= delta_max
+            delta = torch.clamp(delta, min=-delta_max, max=delta_max)
+
+            # ✅ 更新并投影到 [0, lambda_max]
+            self._lagrange_multiplier = torch.clamp(
+                self._lagrange_multiplier + delta,
+                min=0.0,
+                max=lambda_max,
+            )
+
+            self._logger.store({
+                'Value/lagrange_multiplier': float(self._lagrange_multiplier.item()),
+                'Value/wccvar': float(J.item()),
+                'Value/wccvar_gap': float(gap.item()),
+                'Value/lambda_delta': float(delta.item()),  # 可选：方便看是不是被 clip 住
+            })
+
+
+
+    # def _update_lagrange_multiplier_wccvar(self, obs: torch.Tensor) -> None:
+    #     alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+    #     cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
+    #     lambda_lr = float(self._cfgs.lagrange_cfgs.lambda_lr)
+
+    #     # 上界（配置里可选）
+    #     lambda_max = float(self.lambda_max)
+
+    #     with torch.no_grad():
+    #         # ✅ 用 (s, pi(s))，对齐 actor
+    #         act_pi = self._actor_critic.actor.predict(obs, deterministic=True)
+
+    #         mu_log, std_log = self._get_cost_dist_params(self._actor_critic.target_cost_critic, obs, act_pi)
+
+
+    #         # 数值保护：只为了防止 NaN 污染 λ（不改变你的目标，只是保护）
+    #         if not torch.isfinite(mu_log).all() or not torch.isfinite(std_log).all():
+    #             return
+
+    #         # 计算 WCCVaR（每个样本一个值）
+    #         wccvar = self._lognormal_cvar(mu_log, std_log, alpha)  # [B,1]
+    #         if wccvar.dim() == 2:
+    #             wccvar = wccvar.squeeze(-1)  # [B]
+
+    #         if not torch.isfinite(wccvar).all():
+    #             return
+
+    #         J = wccvar.mean()               # 标量：mini-batch 上的风险估计
+    #         gap = J - cost_limit            # 标量：>0 则违反约束
+
+    #         # ✅ 手动 SGD ascent + 投影 + 上界
+    #         self._lagrange_multiplier = torch.clamp(
+    #             self._lagrange_multiplier + lambda_lr * gap,
+    #             min=0.0,
+    #             max=lambda_max,
+    #         )
+
+    #         self._logger.store({
+    #             'Value/lagrange_multiplier': float(self._lagrange_multiplier.item()),
+    #             'Value/wccvar': float(J.item()),
+                
+    #         })
+
+
+

@@ -158,6 +158,16 @@ class WCSAC_IQN(WCSAC):
         if not torch.isfinite(current_quantiles).all():
             raise RuntimeError('cost_critic outputs NaN/Inf')
 
+        # 计算阻尼项 (基于 real actions 的 sampled CVaR 与 cost_limit 的差值)
+        damp_scale = float(self._cfgs.algo_cfgs.get('damp_scale', 10.0))
+        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
+        cvar_samples = self._cfgs.algo_cfgs.get('cvar_quantile_samples', 32)
+        alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+        with torch.no_grad():
+            tau_cvar_real = torch.rand(batch_size, cvar_samples, device=device) * alpha
+            cvar_real = self._actor_critic.cost_critic(obs, action, tau_cvar_real).mean(dim=1)
+        self._damp = damp_scale * (cost_limit - cvar_real.mean()).item()
+
         # 构建 TD error: delta_{i,j} = target_j - current_i
         # target: [B, N', 1] -> [B, 1, N']; current: [B, N, 1]
         td_error = (
@@ -181,10 +191,20 @@ class WCSAC_IQN(WCSAC):
             )
         self._actor_critic.cost_critic_optimizer.step()
 
+        # IQN 专有统计
+        quantiles_sq = current_quantiles.squeeze(-1)  # [B, N]
+        iqn_quantile_mean = quantiles_sq.mean().item()
+        iqn_quantile_span = (quantiles_sq.max(dim=1).values - quantiles_sq.min(dim=1).values).mean().item()
+        iqn_quantile_std = quantiles_sq.std(dim=1).mean().item()
+
         self._logger.store(
             {
                 'Loss/Loss_cost_critic': loss.item(),
                 'Value/cost_critic': current_quantiles.mean().item(),
+                'Value/damp': self._damp,
+                'Value/iqn_quantile_mean': iqn_quantile_mean,
+                'Value/iqn_quantile_span': iqn_quantile_span,
+                'Value/iqn_quantile_std': iqn_quantile_std,
             },
         )
 
@@ -241,7 +261,7 @@ class WCSAC_IQN(WCSAC):
             cvar = self._compute_cvar(obs, action)
 
             if torch.isfinite(cvar).all():
-                loss_cost = self._lagrange_multiplier * cvar.squeeze(-1)
+                loss_cost = (self._lagrange_multiplier - self._damp) * cvar.squeeze(-1)
 
         total_loss = (loss_entropy + loss_reward + loss_cost).mean()
 
@@ -309,13 +329,25 @@ class WCSAC_IQN(WCSAC):
     # ==================== 日志 ====================
 
     def _init_log(self) -> None:
-        """Register logging keys. Overrides WCSAC to keep compatible keys."""
-        super()._init_log()
-        # 父类 WCSAC._init_log 注册了 wccvar, lagrange_multiplier, cost_mean, cost_var
-        # IQN 不使用 cost_mean/cost_var（高斯专用），但注册了也不影响运行
+        """Register IQN-specific logging keys (no Gaussian cost_mean/cost_var)."""
+        SAC._init_log(self)
+        self._logger.register_key('Value/wccvar')
+        self._logger.register_key('Value/lagrange_multiplier')
+        self._logger.register_key('Value/damp')
+        self._logger.register_key('Value/iqn_quantile_mean')
+        self._logger.register_key('Value/iqn_quantile_span')
+        self._logger.register_key('Value/iqn_quantile_std')
 
     def _log_when_not_update(self) -> None:
-        """Log default values when not updating."""
-        super()._log_when_not_update()
-        # 父类 WCSAC._log_when_not_update 已注册了 wccvar, lagrange_multiplier,
-        # cost_mean, cost_var 的默认值
+        """Log default values when not updating (no Gaussian keys)."""
+        SAC._log_when_not_update(self)
+        self._logger.store(
+            {
+                'Value/wccvar': 0.0,
+                'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
+                'Value/damp': 0.0,
+                'Value/iqn_quantile_mean': 0.0,
+                'Value/iqn_quantile_span': 0.0,
+                'Value/iqn_quantile_std': 0.0,
+            },
+        )

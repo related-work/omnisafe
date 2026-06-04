@@ -46,6 +46,7 @@ defaults:
     auto_alpha: False
     use_cost: True
     warmup_epochs: 100
+    damp_scale: 10.0
     # ====== IQN 专用参数 ======
     iqn_n_quantiles: 32
     iqn_kappa: 1.0
@@ -72,7 +73,8 @@ defaults:
       lr: 0.0003
       iqn_embedding_dim: 64
   lagrange_cfgs:
-    cost_limit: 25.0
+    # cost_limit: 25.0
+    cost_limit: 5.0
     lagrangian_multiplier_init: 0.001
     lambda_lr: 0.00001
     lambda_optimizer: "Adam"
@@ -89,7 +91,8 @@ SafetyCarCircle1-v0:
     critic:
       lr: 0.001
   lagrange_cfgs:
-    cost_limit: 25.0
+    cost_limit: 5.0
+    # cost_limit: 25.0
     lagrangian_multiplier_init: 0.000
     lambda_lr: 0.0000005
     lambda_optimizer: "Adam"
@@ -104,7 +107,8 @@ SafetyCarGoal1-v0:
     critic:
       lr: 0.001
   lagrange_cfgs:
-    cost_limit: 25.0
+    cost_limit: 5.0
+    # cost_limit: 25.0
     lagrangian_multiplier_init: 0.000
     lambda_lr: 0.0000005
     lambda_optimizer: "Adam"
@@ -119,7 +123,8 @@ SafetyPointCircle1-v0:
     critic:
       lr: 0.001
   lagrange_cfgs:
-    cost_limit: 25.0
+    # cost_limit: 25.0
+    cost_limit: 5.0
     lagrangian_multiplier_init: 0.000
     lambda_lr: 0.0000005
     lambda_optimizer: "Adam"
@@ -134,7 +139,8 @@ SafetyPointGoal1-v0:
     critic:
       lr: 0.001
   lagrange_cfgs:
-    cost_limit: 25.0
+    # cost_limit: 25.0
+    cost_limit: 5.0
     lagrangian_multiplier_init: 0.000
     lambda_lr: 0.0000005
     lambda_optimizer: "Adam"

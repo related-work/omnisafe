@@ -319,33 +319,48 @@ SafeMetaDrive:
     # actor network configurations
     actor:
       # hidden layer sizes
-      hidden_sizes: [256, 256]
+      hidden_sizes: [256, 256, 256]
       # learning rate
-      lr: 0.00005
+      lr: 0.0003
     # critic network configurations
     critic:
       # hidden layer sizes
-      hidden_sizes: [256, 256]
+      hidden_sizes: [256, 256, 256]
       # learning rate
-      lr: 0.00005
+      lr: 0.0003
   # environment specific configurations
   env_cfgs:
-  # safe meta drive configurations. More details refer to https://github.com/decisionforce/EGPO
+  # SafeMetaDrive configurations. Reference: https://metadrive-simulator.readthedocs.io/
     meta_drive_config:
-      # max iterations of interactions
-      horizon: 1500
-      # whether to use random traffic
-      random_traffic: False
-      # the penalty when crash into other vehicles
-      crash_vehicle_penalty: 1.
-      # the penalty when crash into other objects
-      crash_object_penalty: 0.5
-      # the penalty when out of road
-      out_of_road_penalty: 1.
+      # max steps per episode
+      horizon: 1000
+      # number of distinct scenarios
+      num_scenarios: 100
+      # probability of accident objects on each block
+      accident_prob: 0.1
+      # traffic density (0.0 ~ 1.0)
+      traffic_density: 0.10
+      # cost signals (for safety constraint)
+      crash_vehicle_cost: 1.0
+      crash_object_cost: 1.0
+      out_of_road_cost: 1.0
+      start_seed: 1000
+      crash_vehicle_done: false
+      crash_object_done: false
+      truncate_as_terminate: false
+      # --- Observation mode ---
+      # "lidar" (default): 240-beam LiDAR + 19-d vehicle state = 259 dims
+      # "image": set image_observation: true, output (84, 84, 5) instead
+      image_observation: false
+      # Adjust lidar resolution (num_lasers) to trade off observation size vs detail
+      vehicle_config:
+        lidar:
+          num_lasers: 240
+          distance: 50
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation
-    cost_limit: 0.0
+    cost_limit: 1.0
     # Initial value of lagrangian multiplier
     lagrangian_multiplier_init: 0.01
     # Learning rate of lagrangian multiplier

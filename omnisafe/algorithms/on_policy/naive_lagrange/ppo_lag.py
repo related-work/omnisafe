@@ -14,12 +14,16 @@
 # ==============================================================================
 """Implementation of the Lagrange version of the PPO algorithm."""
 
+import csv
+import os
+
 import numpy as np
 import torch
 
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.on_policy.base.ppo import PPO
 from omnisafe.common.lagrange import Lagrange
+from omnisafe.utils import distributed
 
 
 @registry.register
@@ -36,6 +40,8 @@ class PPOLag(PPO):
         """
         super()._init()
         self._lagrange: Lagrange = Lagrange(**self._cfgs.lagrange_cfgs)
+        self._rollout_csv_path: str = ''
+        self._rollout_csv_initialized: bool = False
 
     def _init_log(self) -> None:
         """Log the PPOLag specific information.
@@ -48,6 +54,12 @@ class PPOLag(PPO):
         """
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier', min_and_max=True)
+
+        rank = distributed.get_rank()
+        filename = 'rollout_buffer.csv'
+        if distributed.world_size() > 1:
+            filename = f'rollout_buffer_rank{rank}.csv'
+        self._rollout_csv_path = os.path.join(self._logger.log_dir, filename)
 
     def _update(self) -> None:
         r"""Update actor, critic, as we used in the :class:`PolicyGradient` algorithm.
@@ -69,6 +81,8 @@ class PPOLag(PPO):
 
             where :math:`\lambda` is the Lagrange multiplier parameter.
         """
+        self._save_rollout_to_csv()
+
         # note that logger already uses MPI statistics across all processes..
         Jc = self._logger.get_stats('Metrics/EpCost')[0]
         assert not np.isnan(Jc), 'cost for updating lagrange multiplier is nan'
@@ -78,6 +92,42 @@ class PPOLag(PPO):
         super()._update()
 
         self._logger.store({'Metrics/LagrangeMultiplier': self._lagrange.lagrangian_multiplier})
+
+    def _save_rollout_to_csv(self) -> None:
+        """Save the current rollout buffer to a CSV file before buffer reset."""
+        os.makedirs(self._logger.log_dir, exist_ok=True)
+
+        fieldnames = ['rollout_id', 'returns_c', 'timestep', 'step', 'env', 'reward', 'cost']
+        rollout_id = self._logger.current_epoch
+        num_envs = len(self._buf.buffers)
+        rows = []
+
+        for env_idx, buffer in enumerate(self._buf.buffers):
+            valid_size = buffer.ptr
+            rewards = buffer.data['reward'][:valid_size].detach().cpu()
+            costs = buffer.data['cost'][:valid_size].detach().cpu()
+            returns_c = buffer.data['target_value_c'][:valid_size].detach().cpu()
+
+            for step_idx in range(valid_size):
+                timestep = rollout_id * self._steps_per_epoch * num_envs + step_idx * num_envs + env_idx
+                rows.append(
+                    {
+                        'rollout_id': rollout_id,
+                        'returns_c': float(returns_c[step_idx].item()),
+                        'timestep': timestep,
+                        'step': step_idx,
+                        'env': env_idx,
+                        'reward': float(rewards[step_idx].item()),
+                        'cost': float(costs[step_idx].item()),
+                    },
+                )
+
+        with open(self._rollout_csv_path, mode='a', encoding='utf-8', newline='') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if not self._rollout_csv_initialized:
+                writer.writeheader()
+                self._rollout_csv_initialized = True
+            writer.writerows(rows)
 
     def _compute_adv_surrogate(self, adv_r: torch.Tensor, adv_c: torch.Tensor) -> torch.Tensor:
         r"""Compute surrogate loss.

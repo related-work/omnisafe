@@ -103,11 +103,14 @@ class TimeLimit(Wrapper):
         obs, reward, cost, terminated, truncated, info = super().step(action)
 
         self._time += 1
-        truncated = torch.tensor(
+        terminated = torch.as_tensor(terminated, dtype=torch.bool, device=self._device)
+        truncated = torch.as_tensor(truncated, dtype=torch.bool, device=self._device)
+        time_limit_truncated = torch.tensor(
             self._time >= self._time_limit,
             dtype=torch.bool,
             device=self._device,
         )
+        truncated = torch.logical_or(truncated, time_limit_truncated)
 
         return obs, reward, cost, terminated, truncated, info
 
@@ -160,7 +163,8 @@ class AutoReset(Wrapper):
         """
         obs, reward, cost, terminated, truncated, info = super().step(action)
 
-        if terminated or truncated:
+        should_reset = bool(torch.as_tensor(terminated).item() or torch.as_tensor(truncated).item())
+        if should_reset:
             new_obs, new_info = self.reset()
             assert (
                 'final_observation' not in new_info

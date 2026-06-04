@@ -126,3 +126,74 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.001
+
+SafeMetaDrive:
+  # training configurations
+  train_cfgs:
+    # total number of steps to train
+    total_steps: 500000
+  # logger configurations
+  logger_cfgs:
+    # save model frequency
+    save_model_freq: 15
+  # algorithm configurations
+  algo_cfgs:
+    # batch size for each iteration
+    batch_size: 256
+    # entropy coefficient
+    entropy_coef: 0.01
+    # number of steps to update the policy
+    steps_per_epoch: 3000
+    # number of iterations to update the policy
+    update_iters: 40
+    # normalize reward
+    reward_normalize: False
+    # normalize cost
+    cost_normalize: True
+    # normalize observation
+    obs_normalize: False
+    # max gradient norm
+    max_grad_norm: 0.05
+  # model configurations
+  model_cfgs:
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [256, 256, 256]
+      # learning rate
+      lr: 0.0003
+    # critic network configurations
+    critic:
+      # hidden layer sizes
+      hidden_sizes: [256, 256, 256]
+      # learning rate
+      lr: 0.0003
+  # environment specific configurations
+  env_cfgs:
+  # SafeMetaDrive configurations. Reference: https://metadrive-simulator.readthedocs.io/
+    meta_drive_config:
+      # max steps per episode
+      horizon: 1000
+      # number of distinct scenarios
+      num_scenarios: 100
+      # probability of accident objects on each block
+      accident_prob: 0.1
+      # traffic density (0.0 ~ 1.0)
+      traffic_density: 0.10
+      # cost signals (for safety constraint)
+      crash_vehicle_cost: 1.0
+      crash_object_cost: 1.0
+      out_of_road_cost: 1.0
+      start_seed: 1000
+      crash_vehicle_done: false
+      crash_object_done: false
+      truncate_as_terminate: false
+      # --- Observation mode ---
+      # "lidar" (default): 240-beam LiDAR + 19-d vehicle state = 259 dims
+      # "image": set image_observation: true, output (84, 84, 5) instead
+      image_observation: false
+      # Adjust lidar resolution (num_lasers) to trade off observation size vs detail
+      vehicle_config:
+        lidar:
+          num_lasers: 240
+          distance: 50
