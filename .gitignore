@@ -3,10 +3,19 @@
 **/exp-x
 train/
 research_runs/
-examples/
+# examples: only exclude data/runs, keep scripts
+examples/runs/
+examples/benchmarks/exp-x/
+examples/benchmarks/data/
+examples/test/
+examples/test.tar.gz
+examples/*.ipynb
+examples/cvar.py
+examples/gpt.py
 tutorials/
-benchmarks/
+/benchmarks/
 images/
+hpo_results/
 omnisafe.egg-info/
 docs/superpowers/
 .github/workflows/

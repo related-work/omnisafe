@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+WCSAC / WCSAC_IQN 超参数自动搜索（Optuna）。
+
+每个 trial 在 3 个随机种子 [111, 222, 333] 下各训练 100w 步，
+取平均 reward/cost 作为目标值。约束：mean_cost ≤ 5.0。
+
+用法:
+    python examples/benchmarks/run_wcsac_hpo.py          # 所有环境
+    python examples/benchmarks/run_wcsac_hpo.py --env SafetyPointGoal1-v0  # 单个环境
+    python examples/benchmarks/run_wcsac_hpo.py --algo WCSAC               # 单个算法
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Any
+
+import numpy as np
+import yaml
+
+import omnisafe
+
+
+# ==============================================================================
+# 配置
+# ==============================================================================
+
+ENV_IDS = [
+    'SafetyPointGoal1-v0',
+    'SafetyPointCircle2-v0',
+    'SafetyHopperVelocity-v1',
+    'SafetyHumanoidVelocity-v1',
+    'SafetyAntVelocity-v1',
+    'SafetyPointButton1-v0',
+]
+
+ALGOS = ['WCSAC', 'WCSAC_IQN']
+
+# 每个 trial 的训练步数（全量）
+TOTAL_STEPS = 1_000_000
+
+# 每个 trial 的随机种子列表
+SEEDS = [111, 222, 333]
+
+# 默认使用所有可用 GPU，设为 [] 或 None 则用 CPU
+AVAILABLE_GPUS = list(range(8))  # 8 张卡
+
+# 并行 trial 数（建议 = GPU 数量，每卡最多跑 1 个 trial）
+N_JOBS = 8
+
+# 每个 (algo, env) 组合的 trial 数
+N_TRIALS = 30
+
+# 结果保存目录
+OUTPUT_DIR = './hpo_results'
+
+# ---- 固定不变的参数 ----
+COST_LIMIT = 5.0
+ALPHA = 0.2          # SAC 默认温度系数
+GAMMA = 0.99         # 折扣因子
+HIDDEN_SIZES = [256, 256, 256]
+
+
+# ==============================================================================
+# 超参数搜索空间
+# ==============================================================================
+
+def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
+    """构建含参数值的 trial 目录名，方便 TensorBoard 查看。"""
+    alr = params['model_cfgs:actor:lr']
+    clr = params['model_cfgs:critic:lr']
+    bs = params['algo_cfgs:batch_size']
+    pk = params['algo_cfgs:polyak']
+    llr = params['lagrange_cfgs:lambda_lr']
+    mi = params['lagrange_cfgs:lagrangian_multiplier_init']
+    return (
+        f'trial_{trial_number:03d}_'
+        f'alr{alr:.0e}_clr{clr:.0e}_'
+        f'bs{bs}_pk{pk:.4f}_'
+        f'llr{llr:.2e}_mi{mi}'
+    )
+
+
+def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
+    """为一个 trial 采样超参数（6 个搜索参数）。"""
+    return {
+        # Actor 学习率
+        'model_cfgs:actor:lr': trial.suggest_categorical(
+            'actor_lr', [1e-5, 1e-4, 3e-4, 1e-3],
+        ),
+        # Critic 学习率
+        'model_cfgs:critic:lr': trial.suggest_categorical(
+            'critic_lr', [1e-5, 1e-4, 3e-4, 1e-3],
+        ),
+        # 批量大小
+        'algo_cfgs:batch_size': trial.suggest_categorical(
+            'batch_size', [64, 128, 256, 512],
+        ),
+        # 目标网络软更新系数
+        'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
+        # Lagrange 乘子学习率
+        'lagrange_cfgs:lambda_lr': trial.suggest_float(
+            'lambda_lr', 3e-4, 3e-3, log=True,
+        ),
+        # Lagrange 乘子初始值
+        'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
+            'lagrangian_multiplier_init', [0.01, 0.1, 0.5, 1.0],
+        ),
+    }
+
+
+def make_custom_cfgs(
+    algo: str,
+    env_id: str,
+    params: dict[str, Any],
+    log_dir: str,
+    seed: int,
+    gpu_id: int | None = None,
+) -> dict[str, Any]:
+    """根据搜索参数构建 OmniSafe custom_cfgs 字典。"""
+    device = f'cuda:{gpu_id}' if gpu_id is not None else 'cpu'
+    custom_cfgs: dict[str, Any] = {
+        'train_cfgs': {
+            'device': device,
+            'total_steps': TOTAL_STEPS,
+            'torch_threads': 1,
+        },
+        'algo_cfgs': {
+            'gamma': GAMMA,
+            'alpha': ALPHA,
+        },
+        'model_cfgs': {
+            'actor': {
+                'hidden_sizes': HIDDEN_SIZES,
+            },
+            'critic': {
+                'hidden_sizes': HIDDEN_SIZES,
+            },
+        },
+        'logger_cfgs': {
+            'use_wandb': False,
+            'use_tensorboard': True,
+            'log_dir': log_dir,
+            'save_model_freq': 10_000_000,
+        },
+        'lagrange_cfgs': {
+            'cost_limit': COST_LIMIT,
+            'lambda_optimizer': 'Adam',
+            'cvar_alpha': 0.9,
+        },
+        'seed': seed,
+    }
+
+    # 将搜索参数写入对应段
+    for key, value in params.items():
+        if key.startswith('algo_cfgs:'):
+            custom_cfgs['algo_cfgs'][key.split(':')[1]] = value
+        elif key.startswith('model_cfgs:'):
+            section, field = key.split(':')[1], key.split(':')[2]
+            custom_cfgs['model_cfgs'][section][field] = value
+        elif key.startswith('lagrange_cfgs:'):
+            custom_cfgs['lagrange_cfgs'][key.split(':')[1]] = value
+
+    return custom_cfgs
+
+
+def run_single_seed(
+    algo: str,
+    env_id: str,
+    params: dict[str, Any],
+    log_dir: str,
+    seed: int,
+    gpu_id: int | None = None,
+) -> tuple[float, float]:
+    """单种子训练，返回 (reward, cost)。"""
+    import torch
+    custom_cfgs = make_custom_cfgs(algo, env_id, params, log_dir, seed, gpu_id)
+
+    agent = omnisafe.Agent(algo, env_id, custom_cfgs=custom_cfgs)
+    reward, cost, _ep_len = agent.learn()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return float(reward), float(cost)
+
+
+def objective(
+    trial: 'optuna.Trial',
+    algo: str,
+    env_id: str,
+    base_log_dir: str,
+    gpus: list[int],
+) -> float:
+    """目标函数：3 个种子取平均，cost 超标时给惩罚。"""
+    params = suggest_params(trial)
+
+    # 按 trial 编号轮询分配 GPU
+    gpu_id = gpus[trial.number % len(gpus)] if gpus else None
+
+    # 构建带参数名的目录，方便 TensorBoard 浏览
+    trial_dir = _build_trial_name(trial.number, params)
+
+    rewards = []
+    costs = []
+
+    for seed in SEEDS:
+        log_dir = os.path.join(base_log_dir, trial_dir, f'seed_{seed:03d}')
+        try:
+            reward, cost = run_single_seed(algo, env_id, params, log_dir, seed, gpu_id)
+            rewards.append(reward)
+            costs.append(cost)
+        except Exception as exc:
+            print(f'[Trial {trial.number}] seed={seed} 异常: {exc}')
+            rewards.append(-1e6)
+            costs.append(1e6)
+
+    mean_reward = float(np.mean(rewards))
+    mean_cost = float(np.mean(costs))
+    std_reward = float(np.std(rewards))
+    std_cost = float(np.std(costs))
+
+    # 保存结果
+    trial.set_user_attr('mean_reward', mean_reward)
+    trial.set_user_attr('mean_cost', mean_cost)
+    trial.set_user_attr('std_reward', std_reward)
+    trial.set_user_attr('std_cost', std_cost)
+    trial.set_user_attr('full_params', params)
+
+    # 目标：cost 在限制内最大化 reward，超标给惩罚
+    if mean_cost <= COST_LIMIT:
+        value = mean_reward
+    else:
+        penalty = 1000.0 * (mean_cost / COST_LIMIT - 1.0)
+        value = mean_reward - penalty
+
+    print(
+        f'[Trial {trial.number:03d}] algo={algo}  env={env_id}\n'
+        f'  params: actor_lr={params["model_cfgs:actor:lr"]:.1e}  '
+        f'critic_lr={params["model_cfgs:critic:lr"]:.1e}  '
+        f'batch={params["algo_cfgs:batch_size"]}  '
+        f'polyak={params["algo_cfgs:polyak"]:.4f}\n'
+        f'           lambda_lr={params["lagrange_cfgs:lambda_lr"]:.2e}  '
+        f'mult_init={params["lagrange_cfgs:lagrangian_multiplier_init"]}\n'
+        f'  reward: {rewards}  ->  mean={mean_reward:.2f} ± {std_reward:.2f}\n'
+        f'  cost:   {[f"{c:.2f}" for c in costs]}  ->  mean={mean_cost:.2f} ± {std_cost:.2f}\n'
+        f'  value={value:.2f}',
+    )
+    return value
+
+
+def run_hpo_for_env(
+    algo: str,
+    env_id: str,
+    n_trials: int,
+    output_dir: str,
+    gpus: list[int],
+    n_jobs: int,
+) -> dict[str, Any]:
+    """对单个 (algo, env_id) 组合运行 HPO。"""
+    import optuna
+
+    study_name = f'{algo}_{env_id}'
+    storage_path = os.path.join(output_dir, f'{study_name}.db')
+
+    print(f'\n{"=" * 60}')
+    print(f'启动 HPO: {study_name}')
+    print(f'Trials: {n_trials}  |  步数: {TOTAL_STEPS:,}  |  Seeds: {SEEDS}')
+    print(f'GPU: {gpus}  |  并行: {n_jobs} jobs')
+    print(f'搜索参数: actor_lr, critic_lr, batch_size, polyak, lambda_lr, multiplier_init')
+    print(f'{"=" * 60}\n')
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=f'sqlite:///{storage_path}',
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        load_if_exists=True,
+    )
+
+    base_log_dir = os.path.join(output_dir, study_name)
+    os.makedirs(base_log_dir, exist_ok=True)
+
+    study.optimize(
+        lambda trial: objective(trial, algo, env_id, base_log_dir, gpus),
+        n_trials=n_trials,
+        n_jobs=n_jobs,
+        show_progress_bar=True,
+    )
+
+    best = study.best_trial
+    best_params = best.user_attrs.get('full_params', {})
+    best_cfgs = make_custom_cfgs(algo, env_id, best_params, log_dir='./runs', seed=0)
+
+    result = {
+        'algo': algo,
+        'env_id': env_id,
+        'best_value': best.value,
+        'mean_reward': best.user_attrs.get('mean_reward', float('nan')),
+        'mean_cost': best.user_attrs.get('mean_cost', float('nan')),
+        'std_reward': best.user_attrs.get('std_reward', float('nan')),
+        'std_cost': best.user_attrs.get('std_cost', float('nan')),
+        'best_params': best_params,
+        'best_custom_cfgs': best_cfgs,
+        'n_trials': len(study.trials),
+    }
+
+    print(f'\n--- 最佳: {study_name} ---')
+    print(f'  Value:  {best.value:.2f}')
+    print(f'  Reward: {result["mean_reward"]:.2f} ± {result["std_reward"]:.2f}')
+    print(f'  Cost:   {result["mean_cost"]:.2f} ± {result["std_cost"]:.2f}')
+    print(f'  Params: {best_params}')
+
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='WCSAC HPO with Optuna')
+    parser.add_argument('--algo', type=str, default=None, help='只跑指定算法，逗号分隔多个')
+    parser.add_argument('--env', type=str, default=None, help='只跑指定环境，逗号分隔多个')
+    parser.add_argument('--trials', type=int, default=N_TRIALS, help='每个组合的 trial 数')
+    parser.add_argument('--gpus', type=str, default=None, help='GPU 编号，逗号分隔（默认 0-7）')
+    parser.add_argument('--parallel', type=int, default=None, help='并行 trial 数（默认 8）')
+    parser.add_argument('--cpu', action='store_true', help='强制使用 CPU')
+    args = parser.parse_args()
+
+    algos = [a.strip() for a in args.algo.split(',')] if args.algo else ALGOS
+    envs = [e.strip() for e in args.env.split(',')] if args.env else ENV_IDS
+    n_trials = args.trials
+
+    if args.cpu:
+        gpus = []
+        n_jobs = 1
+    else:
+        gpus = [int(g.strip()) for g in args.gpus.split(',')] if args.gpus else AVAILABLE_GPUS
+        n_jobs = args.parallel if args.parallel else N_JOBS
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print(f'GPU 分配: {gpus if gpus else "CPU"}')
+    print(f'并行数:   {n_jobs}')
+    print(f'环境:     {envs}')
+    print(f'算法:     {algos}')
+
+    all_results = []
+
+    for algo in algos:
+        for env_id in envs:
+            result = run_hpo_for_env(algo, env_id, n_trials, OUTPUT_DIR, gpus, n_jobs)
+            all_results.append(result)
+
+    # ---- 汇总保存 ----
+    summary = {
+        'hpo_config': {
+            'total_steps': TOTAL_STEPS,
+            'seeds': SEEDS,
+            'n_trials': n_trials,
+            'cost_limit': COST_LIMIT,
+            'alpha': ALPHA,
+            'gamma': GAMMA,
+            'hidden_sizes': HIDDEN_SIZES,
+            'search_params': [
+                'actor_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
+                'critic_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
+                'batch_size: categorical [64, 128, 256, 512]',
+                'polyak: uniform [0.001, 0.02]',
+                'lambda_lr: log-uniform [3e-4, 3e-3]',
+                'lagrangian_multiplier_init: categorical [0.01, 0.1, 0.5, 1.0]',
+            ],
+        },
+        'results': [
+            {
+                'algo': r['algo'],
+                'env_id': r['env_id'],
+                'best_value': r['best_value'],
+                'mean_reward': r['mean_reward'],
+                'mean_cost': r['mean_cost'],
+                'std_reward': r['std_reward'],
+                'std_cost': r['std_cost'],
+                'best_params': r['best_params'],
+            }
+            for r in all_results
+        ],
+    }
+
+    summary_path = os.path.join(OUTPUT_DIR, 'hpo_summary.yaml')
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        yaml.dump(summary, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    print(f'\n{"=" * 60}')
+    print(f'HPO 完成！共 {len(all_results)} 组搜索。')
+    print(f'结果汇总: {summary_path}')
+    print(f'{"=" * 60}')
+
+    print(f'\n{"Algo":<16} {"Env":<30} {"Reward":>14} {"Cost":>14} {"Value":>12}')
+    print('-' * 86)
+    for r in all_results:
+        print(
+            f'{r["algo"]:<16} {r["env_id"]:<30} '
+            f'{r["mean_reward"]:>8.2f} ± {r["std_reward"]:>4.2f}  '
+            f'{r["mean_cost"]:>8.2f} ± {r["std_cost"]:>4.2f}  '
+            f'{r["best_value"]:>12.2f}',
+        )
+
+
+if __name__ == '__main__':
+    main()
