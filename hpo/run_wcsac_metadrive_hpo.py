@@ -19,12 +19,9 @@ os.environ['PYTHON_OPTIMIZE'] = '2'
 def _force_panda3d_headless() -> None:
     """强制 Panda3D 无头模式，允许多进程各自持有 ShowBase。"""
     try:
-        from panda3d.core import load_prc_file_data
-        load_prc_file_data(
-            '',
-            'window-type offscreen\naudio-library-name null\n'
-            'load-display pandagl\naux-display pandagl\n',
-        )
+        from panda3d.core import loadPrcFileData
+        loadPrcFileData('', 'window-type offscreen')
+        loadPrcFileData('', 'audio-library-name null')
     except ImportError:
         pass
 
