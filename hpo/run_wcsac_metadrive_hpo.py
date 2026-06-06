@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-WCSAC on SafeMetaDrive 超参数自动搜索（Optuna）。
+WCSAC / WCSAC_IQN on SafeMetaDrive 超参数自动搜索（Optuna）。
 
 每个 trial 在 3 个随机种子 [111, 222, 333] 下各训练 50w 步，
 取平均 reward/cost 作为目标值。约束：mean_cost ≤ 0.0（零碰撞容忍）。
 
 用法:
     python hpo/run_wcsac_metadrive_hpo.py
-    python hpo/run_wcsac_metadrive_hpo.py --trials 20
-    python hpo/run_wcsac_metadrive_hpo.py --gpus 0,1,2,3 --parallel 4
+    python hpo/run_wcsac_metadrive_hpo.py --algo WCSAC_IQN
+    python hpo/run_wcsac_metadrive_hpo.py --trials 20 --gpus 0,1,2,3
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 from typing import Any
 
@@ -27,7 +28,7 @@ import omnisafe
 # ==============================================================================
 
 ENV_ID = 'SafeMetaDrive'
-ALGO = 'WCSAC'
+ALGOS = ['WCSAC', 'WCSAC_IQN']
 
 # 每个 trial 的训练步数（MetaDrive 默认 50w）
 TOTAL_STEPS = 500_000
@@ -67,6 +68,18 @@ METADRIVE_CONFIG = {
     },
 }
 
+# WCSAC_IQN 额外固定参数
+IQN_CFGS = {
+    'algo_cfgs': {
+        'iqn_n_quantiles': 32,
+        'iqn_kappa': 1.0,
+        'cvar_quantile_samples': 32,
+    },
+    'model_cfgs': {
+        'critic': {'iqn_embedding_dim': 64},
+    },
+}
+
 
 # ==============================================================================
 # 超参数搜索空间
@@ -91,25 +104,19 @@ def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
 def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
     """为一个 trial 采样超参数（6 个搜索参数）。"""
     return {
-        # Actor 学习率
         'model_cfgs:actor:lr': trial.suggest_categorical(
             'actor_lr', [1e-5, 1e-4, 3e-4, 1e-3],
         ),
-        # Critic 学习率
         'model_cfgs:critic:lr': trial.suggest_categorical(
             'critic_lr', [1e-5, 1e-4, 3e-4, 1e-3],
         ),
-        # 批量大小
         'algo_cfgs:batch_size': trial.suggest_categorical(
             'batch_size', [64, 128, 256, 512],
         ),
-        # 目标网络软更新系数
         'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
-        # Lagrange 乘子学习率
         'lagrange_cfgs:lambda_lr': trial.suggest_float(
             'lambda_lr', 3e-4, 3e-3, log=True,
         ),
-        # Lagrange 乘子初始值
         'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
             'lagrangian_multiplier_init', [0.01, 0.1, 0.5, 1.0],
         ),
@@ -117,6 +124,7 @@ def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
 
 
 def make_custom_cfgs(
+    algo: str,
     params: dict[str, Any],
     log_dir: str,
     seed: int,
@@ -161,6 +169,7 @@ def make_custom_cfgs(
         'seed': seed,
     }
 
+    # 搜索参数写入
     for key, value in params.items():
         if key.startswith('algo_cfgs:'):
             custom_cfgs['algo_cfgs'][key.split(':')[1]] = value
@@ -170,10 +179,16 @@ def make_custom_cfgs(
         elif key.startswith('lagrange_cfgs:'):
             custom_cfgs['lagrange_cfgs'][key.split(':')[1]] = value
 
+    # WCSAC_IQN 额外参数
+    if algo == 'WCSAC_IQN':
+        custom_cfgs['algo_cfgs'].update(IQN_CFGS['algo_cfgs'])
+        custom_cfgs['model_cfgs']['critic']['iqn_embedding_dim'] = 64
+
     return custom_cfgs
 
 
 def run_single_seed(
+    algo: str,
     params: dict[str, Any],
     log_dir: str,
     seed: int,
@@ -181,9 +196,9 @@ def run_single_seed(
 ) -> tuple[float, float]:
     """单种子训练，返回 (reward, cost)。"""
     import torch
-    custom_cfgs = make_custom_cfgs(params, log_dir, seed, gpu_id)
+    custom_cfgs = make_custom_cfgs(algo, params, log_dir, seed, gpu_id)
 
-    agent = omnisafe.Agent(ALGO, ENV_ID, custom_cfgs=custom_cfgs)
+    agent = omnisafe.Agent(algo, ENV_ID, custom_cfgs=custom_cfgs)
     reward, cost, _ep_len = agent.learn()
 
     if torch.cuda.is_available():
@@ -194,6 +209,7 @@ def run_single_seed(
 
 def objective(
     trial: 'optuna.Trial',
+    algo: str,
     base_log_dir: str,
     gpus: list[int],
 ) -> float:
@@ -208,7 +224,7 @@ def objective(
     for seed in SEEDS:
         log_dir = os.path.join(base_log_dir, trial_dir, f'seed_{seed:03d}')
         try:
-            reward, cost = run_single_seed(params, log_dir, seed, gpu_id)
+            reward, cost = run_single_seed(algo, params, log_dir, seed, gpu_id)
             rewards.append(reward)
             costs.append(cost)
         except Exception as exc:
@@ -227,16 +243,14 @@ def objective(
     trial.set_user_attr('std_cost', std_cost)
     trial.set_user_attr('full_params', params)
 
-    # MetaDrive: cost_limit=0.0，任何碰撞都是违规
     if mean_cost <= COST_LIMIT:
         value = mean_reward
     else:
-        # cost 超标给惩罚（MetaDrive 惩罚更严厉）
         penalty = 2000.0 * (mean_cost - COST_LIMIT)
         value = mean_reward - penalty
 
     print(
-        f'[Trial {trial.number:03d}] {ALGO} on {ENV_ID}\n'
+        f'[Trial {trial.number:03d}] {algo} on {ENV_ID}\n'
         f'  params: actor_lr={params["model_cfgs:actor:lr"]:.1e}  '
         f'critic_lr={params["model_cfgs:critic:lr"]:.1e}  '
         f'batch={params["algo_cfgs:batch_size"]}  '
@@ -251,6 +265,7 @@ def objective(
 
 
 def run_hpo(
+    algo: str,
     n_trials: int,
     output_dir: str,
     gpus: list[int],
@@ -259,7 +274,7 @@ def run_hpo(
     """对 SafeMetaDrive 运行 HPO。"""
     import optuna
 
-    study_name = f'{ALGO}_{ENV_ID}'
+    study_name = f'{algo}_{ENV_ID}'
     storage_path = os.path.join(output_dir, f'{study_name}.db')
 
     print(f'\n{"=" * 60}')
@@ -281,7 +296,7 @@ def run_hpo(
     os.makedirs(base_log_dir, exist_ok=True)
 
     study.optimize(
-        lambda trial: objective(trial, base_log_dir, gpus),
+        lambda trial: objective(trial, algo, base_log_dir, gpus),
         n_trials=n_trials,
         n_jobs=n_jobs,
         show_progress_bar=True,
@@ -289,10 +304,10 @@ def run_hpo(
 
     best = study.best_trial
     best_params = best.user_attrs.get('full_params', {})
-    best_cfgs = make_custom_cfgs(best_params, log_dir='./runs', seed=0)
+    best_cfgs = make_custom_cfgs(algo, best_params, log_dir='./runs', seed=0)
 
     result = {
-        'algo': ALGO,
+        'algo': algo,
         'env_id': ENV_ID,
         'best_value': best.value,
         'mean_reward': best.user_attrs.get('mean_reward', float('nan')),
@@ -314,12 +329,15 @@ def run_hpo(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='WCSAC HPO on SafeMetaDrive')
+    parser = argparse.ArgumentParser(description='WCSAC/WCSAC_IQN HPO on SafeMetaDrive')
+    parser.add_argument('--algo', type=str, default=None, help='算法，逗号分隔（默认 WCSAC,WCSAC_IQN）')
     parser.add_argument('--trials', type=int, default=N_TRIALS, help='Trial 数')
     parser.add_argument('--gpus', type=str, default=None, help='GPU 编号，逗号分隔')
     parser.add_argument('--parallel', type=int, default=None, help='并行数')
     parser.add_argument('--cpu', action='store_true', help='CPU 模式')
     args = parser.parse_args()
+
+    algos = [a.strip() for a in args.algo.split(',')] if args.algo else ALGOS
 
     if args.cpu:
         gpus = []
@@ -332,12 +350,17 @@ def main() -> None:
 
     print(f'GPU 分配: {gpus if gpus else "CPU"}')
     print(f'并行数:   {n_jobs}')
+    print(f'算法:     {algos}')
 
-    result = run_hpo(args.trials, OUTPUT_DIR, gpus, n_jobs)
+    all_results = []
 
+    for algo in algos:
+        result = run_hpo(algo, args.trials, OUTPUT_DIR, gpus, n_jobs)
+        all_results.append(result)
+
+    # ---- 汇总保存 ----
     summary = {
         'hpo_config': {
-            'algo': ALGO,
             'env_id': ENV_ID,
             'total_steps': TOTAL_STEPS,
             'seeds': SEEDS,
@@ -355,21 +378,39 @@ def main() -> None:
                 'lagrangian_multiplier_init: categorical [0.01, 0.1, 0.5, 1.0]',
             ],
         },
-        'result': {
-            'best_value': result['best_value'],
-            'mean_reward': result['mean_reward'],
-            'mean_cost': result['mean_cost'],
-            'std_reward': result['std_reward'],
-            'std_cost': result['std_cost'],
-            'best_params': result['best_params'],
-        },
+        'results': [
+            {
+                'algo': r['algo'],
+                'env_id': r['env_id'],
+                'best_value': r['best_value'],
+                'mean_reward': r['mean_reward'],
+                'mean_cost': r['mean_cost'],
+                'std_reward': r['std_reward'],
+                'std_cost': r['std_cost'],
+                'best_params': r['best_params'],
+            }
+            for r in all_results
+        ],
     }
 
-    summary_path = os.path.join(OUTPUT_DIR, f'{ALGO}_{ENV_ID}_summary.yaml')
+    summary_path = os.path.join(OUTPUT_DIR, 'SafeMetaDrive_hpo_summary.yaml')
     with open(summary_path, 'w', encoding='utf-8') as f:
         yaml.dump(summary, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
-    print(f'\n结果汇总: {summary_path}')
+    print(f'\n{"=" * 60}')
+    print(f'HPO 完成！共 {len(all_results)} 组搜索。')
+    print(f'结果汇总: {summary_path}')
+    print(f'{"=" * 60}')
+
+    print(f'\n{"Algo":<16} {"Env":<20} {"Reward":>14} {"Cost":>14} {"Value":>12}')
+    print('-' * 76)
+    for r in all_results:
+        print(
+            f'{r["algo"]:<16} {r["env_id"]:<20} '
+            f'{r["mean_reward"]:>8.2f} ± {r["std_reward"]:>4.2f}  '
+            f'{r["mean_cost"]:>8.2f} ± {r["std_cost"]:>4.2f}  '
+            f'{r["best_value"]:>12.2f}',
+        )
 
 
 if __name__ == '__main__':

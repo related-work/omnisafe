@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-WCSAC on SafeMetaDrive 单次启动脚本。
+WCSAC / WCSAC_IQN on SafeMetaDrive 单次启动脚本。
 
 用法:
     python hpo/run_wcsac_metadrive.py
-    python hpo/run_wcsac_metadrive.py --seed 42
-    python hpo/run_wcsac_metadrive.py --gpu 0
+    python hpo/run_wcsac_metadrive.py --algo WCSAC_IQN
+    python hpo/run_wcsac_metadrive.py --seed 42 --gpu 0
 """
 import argparse
 
@@ -13,9 +13,9 @@ import omnisafe
 
 
 ENV_ID = 'SafeMetaDrive'
-ALGO = 'WCSAC'
+ALGOS = ['WCSAC', 'WCSAC_IQN']
 
-# SafeMetaDrive 默认最优参数（WCSAC 配置中的值）
+# SafeMetaDrive 默认参数
 DEFAULT_CFGS = {
     'train_cfgs': {
         'device': 'cuda:0',
@@ -51,21 +51,30 @@ DEFAULT_CFGS = {
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='WCSAC on SafeMetaDrive')
+    parser = argparse.ArgumentParser(description='WCSAC/WCSAC_IQN on SafeMetaDrive')
+    parser.add_argument('--algo', type=str, default='WCSAC', choices=ALGOS, help='算法')
     parser.add_argument('--seed', type=int, default=0, help='随机种子')
     parser.add_argument('--gpu', type=int, default=0, help='GPU 编号')
     parser.add_argument('--steps', type=int, default=500_000, help='总训练步数')
     args = parser.parse_args()
 
-    custom_cfgs = DEFAULT_CFGS.copy()
+    import copy
+    custom_cfgs = copy.deepcopy(DEFAULT_CFGS)
     custom_cfgs['train_cfgs']['device'] = f'cuda:{args.gpu}'
     custom_cfgs['train_cfgs']['total_steps'] = args.steps
     custom_cfgs['seed'] = args.seed
 
-    print(f'启动: {ALGO} on {ENV_ID}')
+    # WCSAC_IQN 需要额外的 IQN 参数
+    if args.algo == 'WCSAC_IQN':
+        custom_cfgs['algo_cfgs']['iqn_n_quantiles'] = 32
+        custom_cfgs['algo_cfgs']['iqn_kappa'] = 1.0
+        custom_cfgs['algo_cfgs']['cvar_quantile_samples'] = 32
+        custom_cfgs['model_cfgs']['critic']['iqn_embedding_dim'] = 64
+
+    print(f'启动: {args.algo} on {ENV_ID}')
     print(f'  GPU: {args.gpu}  |  Seed: {args.seed}  |  Steps: {args.steps:,}')
 
-    agent = omnisafe.Agent(ALGO, ENV_ID, custom_cfgs=custom_cfgs)
+    agent = omnisafe.Agent(args.algo, ENV_ID, custom_cfgs=custom_cfgs)
     reward, cost, ep_len = agent.learn()
 
     print(f'训练完成!  reward={reward:.2f}  cost={cost:.2f}  ep_len={ep_len:.2f}')
