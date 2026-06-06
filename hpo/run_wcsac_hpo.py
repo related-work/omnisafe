@@ -74,17 +74,22 @@ def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
     pk = params['algo_cfgs:polyak']
     llr = params['lagrange_cfgs:lambda_lr']
     mi = params['lagrange_cfgs:lagrangian_multiplier_init']
-    return (
+    name = (
         f'trial_{trial_number:03d}_'
         f'alr{alr:.0e}_clr{clr:.0e}_'
         f'bs{bs}_pk{pk:.4f}_'
         f'llr{llr:.2e}_mi{mi}'
     )
+    if 'algo_cfgs:iqn_n_quantiles' in params:
+        nq = params['algo_cfgs:iqn_n_quantiles']
+        ed = params['model_cfgs:critic:iqn_embedding_dim']
+        name += f'_nq{nq}_ed{ed}'
+    return name
 
 
-def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
-    """为一个 trial 采样超参数（6 个搜索参数）。"""
-    return {
+def suggest_params(trial: 'optuna.Trial', algo: str) -> dict[str, Any]:
+    """为一个 trial 采样超参数。WCSAC: 6 参数，WCSAC_IQN: 10 参数。"""
+    params = {
         # Actor 学习率
         'model_cfgs:actor:lr': trial.suggest_categorical(
             'actor_lr', [1e-5, 1e-4, 3e-4, 1e-3],
@@ -108,6 +113,22 @@ def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
             'lagrangian_multiplier_init', [0.01, 0.1, 0.5, 1.0],
         ),
     }
+    if algo == 'WCSAC_IQN':
+        params.update({
+            'algo_cfgs:iqn_n_quantiles': trial.suggest_categorical(
+                'iqn_n_quantiles', [8, 16, 32, 64],
+            ),
+            'algo_cfgs:iqn_kappa': trial.suggest_float(
+                'iqn_kappa', 0.1, 2.0,
+            ),
+            'algo_cfgs:cvar_quantile_samples': trial.suggest_categorical(
+                'cvar_quantile_samples', [8, 16, 32, 64],
+            ),
+            'model_cfgs:critic:iqn_embedding_dim': trial.suggest_categorical(
+                'iqn_embedding_dim', [32, 64, 128],
+            ),
+        })
+    return params
 
 
 def make_custom_cfgs(
@@ -194,7 +215,7 @@ def objective(
     gpus: list[int],
 ) -> float:
     """目标函数：3 个种子取平均，cost 超标时给惩罚。"""
-    params = suggest_params(trial)
+    params = suggest_params(trial, algo)
 
     # 按 trial 编号轮询分配 GPU
     gpu_id = gpus[trial.number % len(gpus)] if gpus else None
@@ -367,6 +388,11 @@ def main() -> None:
                 'polyak: uniform [0.001, 0.02]',
                 'lambda_lr: log-uniform [3e-4, 3e-3]',
                 'lagrangian_multiplier_init: categorical [0.01, 0.1, 0.5, 1.0]',
+                # ---- WCSAC_IQN only ----
+                'iqn_n_quantiles: categorical [8, 16, 32, 64]',
+                'iqn_kappa: uniform [0.1, 2.0]',
+                'cvar_quantile_samples: categorical [8, 16, 32, 64]',
+                'iqn_embedding_dim: categorical [32, 64, 128]',
             ],
         },
         'results': [
