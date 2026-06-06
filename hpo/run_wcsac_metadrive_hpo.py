@@ -193,24 +193,53 @@ def make_custom_cfgs(
     return custom_cfgs
 
 
+def _read_metadrive_metrics(log_dir: str) -> dict[str, float]:
+    """从训练日志 CSV 读取最后 epoch 的 MetaDrive 专用指标。"""
+    import glob
+
+    import pandas as pd
+
+    metrics: dict[str, float] = {}
+    try:
+        pattern = os.path.join(log_dir, '**', 'progress.csv')
+        csv_files = glob.glob(pattern, recursive=True)
+        if not csv_files:
+            return metrics
+        df = pd.read_csv(csv_files[0])
+        if len(df) < 2:
+            return metrics
+        # 取最后一行（有时最后一行是训练不完整的，取倒数第 2 行）
+        row = df.iloc[-2] if len(df) > 1 else df.iloc[-1]
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(k in col_lower for k in ('success', 'crash', 'outofroad', 'arrive')):
+                metrics[col] = float(row[col])
+    except Exception:
+        pass
+    return metrics
+
+
 def run_single_seed(
     algo: str,
     params: dict[str, Any],
     log_dir: str,
     seed: int,
     gpu_id: int | None = None,
-) -> tuple[float, float]:
-    """单种子训练，返回 (reward, cost)。"""
+) -> tuple[float, float, dict[str, float]]:
+    """单种子训练，返回 (reward, cost, metadrive_metrics)。"""
     import torch
     custom_cfgs = make_custom_cfgs(algo, params, log_dir, seed, gpu_id)
 
     agent = omnisafe.Agent(algo, ENV_ID, custom_cfgs=custom_cfgs)
     reward, cost, _ep_len = agent.learn()
 
+    # 读取 MetaDrive 专用指标
+    md_metrics = _read_metadrive_metrics(log_dir)
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return float(reward), float(cost)
+    return float(reward), float(cost), md_metrics
 
 
 def objective(
@@ -227,16 +256,20 @@ def objective(
     rewards = []
     costs = []
 
+    all_md_metrics: list[dict[str, float]] = []
+
     for seed in SEEDS:
         log_dir = os.path.join(base_log_dir, trial_dir, f'seed_{seed:03d}')
         try:
-            reward, cost = run_single_seed(algo, params, log_dir, seed, gpu_id)
+            reward, cost, md_metrics = run_single_seed(algo, params, log_dir, seed, gpu_id)
             rewards.append(reward)
             costs.append(cost)
+            all_md_metrics.append(md_metrics)
         except Exception as exc:
             print(f'[Trial {trial.number}] seed={seed} 异常: {exc}')
             rewards.append(-1e6)
             costs.append(1e6)
+            all_md_metrics.append({})
 
     mean_reward = float(np.mean(rewards))
     mean_cost = float(np.mean(costs))
@@ -248,12 +281,26 @@ def objective(
     trial.set_user_attr('std_reward', std_reward)
     trial.set_user_attr('std_cost', std_cost)
     trial.set_user_attr('full_params', params)
+    # 提取 MetaDrive 指标平均值
+    if all_md_metrics and all_md_metrics[0]:
+        for key in all_md_metrics[0]:
+            vals = [m.get(key, float('nan')) for m in all_md_metrics]
+            trial.set_user_attr(f'md_{key.replace("/", "_")}', float(np.nanmean(vals)))
 
     if mean_cost <= COST_LIMIT:
         value = mean_reward
     else:
         penalty = 2000.0 * (mean_cost - COST_LIMIT)
         value = mean_reward - penalty
+
+    # 构建 MetaDrive 指标摘要
+    md_summary = ''
+    if all_md_metrics and all_md_metrics[0]:
+        md_summary = '\n  MetaDrive: '
+        md_summary += ' | '.join(
+            f'{key.split("/")[-1]}={np.nanmean([m.get(key, float("nan")) for m in all_md_metrics]):.3f}'
+            for key in sorted(all_md_metrics[0].keys())
+        )
 
     print(
         f'[Trial {trial.number:03d}] {algo} on {ENV_ID}\n'
@@ -264,7 +311,8 @@ def objective(
         f'           lambda_lr={params["lagrange_cfgs:lambda_lr"]:.2e}  '
         f'mult_init={params["lagrange_cfgs:lagrangian_multiplier_init"]}\n'
         f'  reward: {rewards}  ->  mean={mean_reward:.2f} ± {std_reward:.2f}\n'
-        f'  cost:   {[f"{c:.2f}" for c in costs]}  ->  mean={mean_cost:.2f} ± {std_cost:.2f}\n'
+        f'  cost:   {[f"{c:.2f}" for c in costs]}  ->  mean={mean_cost:.2f} ± {std_cost:.2f}'
+        f'{md_summary}\n'
         f'  value={value:.2f}',
     )
     return value
