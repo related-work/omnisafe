@@ -8,6 +8,10 @@ WCSAC / WCSAC_IQN on SafeMetaDrive 单次启动脚本。
     python hpo/run_wcsac_metadrive.py --seed 42 --gpu 0
 """
 import argparse
+import os
+
+# 必须在 import omnisafe 之前设置
+os.environ['RENDER_OFFSCREEN'] = '1'
 
 import omnisafe
 

@@ -17,6 +17,9 @@ import copy
 import os
 from typing import Any
 
+# ====== 必须在 import omnisafe 之前设置，强制 MetaDrive/Panda3D headless ======
+os.environ['RENDER_OFFSCREEN'] = '1'
+
 import numpy as np
 import yaml
 
@@ -61,6 +64,7 @@ METADRIVE_CONFIG = {
     'crash_object_cost': 1.0,
     'out_of_road_cost': 1.0,
     'start_seed': 1000,
+    'use_render': False,
     'image_observation': False,
     'vehicle_config': {
         'lidar': {'num_lasers': 240, 'distance': 50},
