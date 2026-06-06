@@ -12,13 +12,26 @@ WCSAC / WCSAC_IQN on SafeMetaDrive 超参数自动搜索（Optuna）。
 """
 from __future__ import annotations
 
-import argparse
-import copy
 import os
-from typing import Any
+# ---- Panda3D headless: 必须在任何 MetaDrive import 之前 ----
+os.environ['PYTHON_OPTIMIZE'] = '2'
 
-# ====== 必须在 import omnisafe 之前设置，强制 MetaDrive/Panda3D headless ======
-os.environ['RENDER_OFFSCREEN'] = '1'
+def _force_panda3d_headless() -> None:
+    """强制 Panda3D 无头模式，允许多进程各自持有 ShowBase。"""
+    try:
+        from panda3d.core import load_prc_file_data
+        load_prc_file_data(
+            '',
+            'window-type offscreen\naudio-library-name null\n'
+            'load-display pandagl\naux-display pandagl\n',
+        )
+    except ImportError:
+        pass
+
+_force_panda3d_headless()
+
+import argparse
+from typing import Any
 
 import numpy as np
 import yaml
@@ -39,9 +52,9 @@ TOTAL_STEPS = 1_000_000
 # 每个 trial 的随机种子列表
 SEEDS = [111, 222, 333]
 
-# 默认 GPU 配置
+# 默认 GPU 配置（MetaDrive 受 Panda3D ShowBase 限制，只能单进程）
 AVAILABLE_GPUS = list(range(8))
-N_JOBS = 8
+N_JOBS = 1
 
 # 每个组合的 trial 数
 N_TRIALS = 30
@@ -64,7 +77,6 @@ METADRIVE_CONFIG = {
     'crash_object_cost': 1.0,
     'out_of_road_cost': 1.0,
     'start_seed': 1000,
-    'use_render': False,
     'image_observation': False,
     'vehicle_config': {
         'lidar': {'num_lasers': 240, 'distance': 50},
