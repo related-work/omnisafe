@@ -19,7 +19,7 @@ ALGOS = ['WCSAC', 'WCSAC_IQN']
 DEFAULT_CFGS = {
     'train_cfgs': {
         'device': 'cuda:0',
-        'total_steps': 500_000,
+        'total_steps': 1_000_000,
         'torch_threads': 1,
     },
     'algo_cfgs': {
@@ -41,11 +41,27 @@ DEFAULT_CFGS = {
         'save_model_freq': 50,
     },
     'lagrange_cfgs': {
-        'cost_limit': 0.0,
+        'cost_limit': 1.0,
         'lagrangian_multiplier_init': 0.01,
         'lambda_lr': 1e-4,
         'lambda_optimizer': 'Adam',
         'cvar_alpha': 0.9,
+    },
+    'env_cfgs': {
+        'meta_drive_config': {
+            'horizon': 1000,
+            'num_scenarios': 10,
+            'accident_prob': 0.1,
+            'traffic_density': 0.10,
+            'crash_vehicle_cost': 1.0,
+            'crash_object_cost': 1.0,
+            'out_of_road_cost': 1.0,
+            'start_seed': 1000,
+            'image_observation': False,
+            'vehicle_config': {
+                'lidar': {'num_lasers': 240, 'distance': 50},
+            },
+        },
     },
 }
 

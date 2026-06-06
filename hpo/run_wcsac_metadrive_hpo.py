@@ -30,8 +30,8 @@ import omnisafe
 ENV_ID = 'SafeMetaDrive'
 ALGOS = ['WCSAC', 'WCSAC_IQN']
 
-# 每个 trial 的训练步数（MetaDrive 默认 50w）
-TOTAL_STEPS = 500_000
+# 每个 trial 的训练步数
+TOTAL_STEPS = 1_000_000
 
 # 每个 trial 的随机种子列表
 SEEDS = [111, 222, 333]
@@ -47,15 +47,14 @@ N_TRIALS = 30
 OUTPUT_DIR = './hpo_results'
 
 # ---- 固定不变的参数 ----
-COST_LIMIT = 0.0     # MetaDrive: 零碰撞容忍
-ALPHA = 0.2          # SAC 默认温度系数
-GAMMA = 0.99         # 折扣因子
+COST_LIMIT = 1.0     # 参考 on-policy 脚本
+GAMMA = 0.99
 HIDDEN_SIZES = [256, 256, 256]
 
-# MetaDrive 环境固定参数（不参与搜索）
+# MetaDrive 环境固定参数（参考 run_onpolicy_safemetadrive_zn.py）
 METADRIVE_CONFIG = {
     'horizon': 1000,
-    'num_scenarios': 100,
+    'num_scenarios': 10,        # 参考 on-policy
     'accident_prob': 0.1,
     'traffic_density': 0.10,
     'crash_vehicle_cost': 1.0,
@@ -75,20 +74,22 @@ METADRIVE_CONFIG = {
 # ==============================================================================
 
 def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
-    """构建含参数值的 trial 目录名，方便 TensorBoard 查看。"""
+    """构建含参数值的 trial 目录名。"""
     alr = params['model_cfgs:actor:lr']
     clr = params['model_cfgs:critic:lr']
     bs = params['algo_cfgs:batch_size']
     pk = params['algo_cfgs:polyak']
+    av = params['algo_cfgs:alpha']
+    mg = params['algo_cfgs:max_grad_norm']
     llr = params['lagrange_cfgs:lambda_lr']
     mi = params['lagrange_cfgs:lagrangian_multiplier_init']
     name = (
         f'trial_{trial_number:03d}_'
         f'alr{alr:.0e}_clr{clr:.0e}_'
         f'bs{bs}_pk{pk:.4f}_'
+        f'av{av:.2e}_mg{mg:.1f}_'
         f'llr{llr:.2e}_mi{mi}'
     )
-    # IQN 参数
     if 'algo_cfgs:iqn_n_quantiles' in params:
         nq = params['algo_cfgs:iqn_n_quantiles']
         ed = params['model_cfgs:critic:iqn_embedding_dim']
@@ -97,23 +98,37 @@ def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
 
 
 def suggest_params(trial: 'optuna.Trial', algo: str) -> dict[str, Any]:
-    """为一个 trial 采样超参数。WCSAC: 6 参数，WCSAC_IQN: 10 参数。"""
+    """为一个 trial 采样超参数。WCSAC: 8 参数，WCSAC_IQN: 12 参数。"""
     params = {
+        # Actor 学习率
         'model_cfgs:actor:lr': trial.suggest_categorical(
-            'actor_lr', [1e-5, 1e-4, 3e-4, 1e-3],
+            'actor_lr', [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
         ),
+        # Critic 学习率
         'model_cfgs:critic:lr': trial.suggest_categorical(
-            'critic_lr', [1e-5, 1e-4, 3e-4, 1e-3],
+            'critic_lr', [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
         ),
+        # 批量大小
         'algo_cfgs:batch_size': trial.suggest_categorical(
             'batch_size', [64, 128, 256, 512],
         ),
+        # 目标网络软更新系数
         'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
-        'lagrange_cfgs:lambda_lr': trial.suggest_float(
-            'lambda_lr', 3e-4, 3e-3, log=True,
+        # SAC 温度系数（参考 on-policy entropy_coef=0.01）
+        'algo_cfgs:alpha': trial.suggest_categorical(
+            'alpha', [0.001, 0.005, 0.01, 0.05, 0.1, 0.2],
         ),
+        # 梯度裁剪（参考 on-policy max_grad_norm=0.5）
+        'algo_cfgs:max_grad_norm': trial.suggest_categorical(
+            'max_grad_norm', [0.5, 1.0, 5.0, 10.0, 40.0],
+        ),
+        # Lagrange 乘子学习率
+        'lagrange_cfgs:lambda_lr': trial.suggest_float(
+            'lambda_lr', 1e-5, 1e-3, log=True,
+        ),
+        # Lagrange 乘子初始值
         'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
-            'lagrangian_multiplier_init', [0.01, 0.1, 0.5, 1.0],
+            'lagrangian_multiplier_init', [0.001, 0.01, 0.1, 0.5, 1.0],
         ),
     }
     if algo == 'WCSAC_IQN':
@@ -151,7 +166,6 @@ def make_custom_cfgs(
         },
         'algo_cfgs': {
             'gamma': GAMMA,
-            'alpha': ALPHA,
             'steps_per_epoch': 2_000,
             'update_cycle': 100,
             'update_iters': 200,
@@ -420,16 +434,18 @@ def main() -> None:
             'seeds': SEEDS,
             'n_trials': args.trials,
             'cost_limit': COST_LIMIT,
-            'alpha': ALPHA,
             'gamma': GAMMA,
             'hidden_sizes': HIDDEN_SIZES,
+            'num_scenarios': METADRIVE_CONFIG['num_scenarios'],
             'search_params': [
-                'actor_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
-                'critic_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
+                'actor_lr: categorical [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]',
+                'critic_lr: categorical [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]',
                 'batch_size: categorical [64, 128, 256, 512]',
                 'polyak: uniform [0.001, 0.02]',
-                'lambda_lr: log-uniform [3e-4, 3e-3]',
-                'lagrangian_multiplier_init: categorical [0.01, 0.1, 0.5, 1.0]',
+                'alpha: categorical [0.001, 0.005, 0.01, 0.05, 0.1, 0.2]',
+                'max_grad_norm: categorical [0.5, 1.0, 5.0, 10.0, 40.0]',
+                'lambda_lr: log-uniform [1e-5, 1e-3]',
+                'lagrangian_multiplier_init: categorical [0.001, 0.01, 0.1, 0.5, 1.0]',
                 # ---- WCSAC_IQN only ----
                 'iqn_n_quantiles: categorical [8, 16, 32, 64]',
                 'iqn_kappa: uniform [0.1, 2.0]',
