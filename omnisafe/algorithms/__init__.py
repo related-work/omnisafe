@@ -26,6 +26,8 @@ from omnisafe.algorithms.model_based import CAPPETS, CCEPETS, LOOP, PETS, RCEPET
 # Off-Policy Safe
 from omnisafe.algorithms.off_policy import (
     CRABS,
+    DCDDPG,
+    DCSAC,
     DDPG,
     DDPGPID,
     SAC,
@@ -36,6 +38,8 @@ from omnisafe.algorithms.off_policy import (
     SACLag,
     SACLag_1,
     TD3Lag,
+    WCSAC,
+    WCSAC_IQN,
 )
 
 # Offline Safe
