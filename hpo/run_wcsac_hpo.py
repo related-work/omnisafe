@@ -57,46 +57,26 @@ OUTPUT_DIR = './hpo_results'
 
 # ---- 固定不变的参数 ----
 COST_LIMIT = 5.0
-ALPHA = 0.2          # SAC 默认温度系数
+ALPHA = 0.693147     # 原实现 softplus(0)
 GAMMA = 0.99         # 折扣因子
-HIDDEN_SIZES = [256, 256, 256]
+HIDDEN_SIZES = [256, 256]
 
 
 # ==============================================================================
 # 超参数搜索空间
 # ==============================================================================
 
-def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
-    """构建含参数值的 trial 目录名，方便 TensorBoard 查看。"""
-    alr = params['model_cfgs:actor:lr']
-    clr = params['model_cfgs:critic:lr']
-    bs = params['algo_cfgs:batch_size']
-    pk = params['algo_cfgs:polyak']
-    llr = params['lagrange_cfgs:lambda_lr']
-    mi = params['lagrange_cfgs:lagrangian_multiplier_init']
-    name = (
-        f'trial_{trial_number:03d}_'
-        f'alr{alr:.0e}_clr{clr:.0e}_'
-        f'bs{bs}_pk{pk:.4f}_'
-        f'llr{llr:.2e}_mi{mi}'
-    )
-    if 'algo_cfgs:iqn_n_quantiles' in params:
-        nq = params['algo_cfgs:iqn_n_quantiles']
-        ed = params['model_cfgs:critic:iqn_embedding_dim']
-        name += f'_nq{nq}_ed{ed}'
-    return name
+def _build_trial_name(trial_number: int) -> str:
+    """构建简洁的 TensorBoard trial 目录名。"""
+    return f'trial_{trial_number:03d}'
 
 
 def suggest_params(trial: 'optuna.Trial', algo: str) -> dict[str, Any]:
     """为一个 trial 采样超参数。WCSAC: 6 参数，WCSAC_IQN: 10 参数。"""
     params = {
-        # Actor 学习率
+        # 原实现对 actor、critics 和 alpha 使用相同基础学习率。
         'model_cfgs:actor:lr': trial.suggest_categorical(
-            'actor_lr', [1e-5, 1e-4, 3e-4, 1e-3],
-        ),
-        # Critic 学习率
-        'model_cfgs:critic:lr': trial.suggest_categorical(
-            'critic_lr', [1e-5, 1e-4, 3e-4, 1e-3],
+            'learning_rate', [1e-4, 3e-4, 1e-3],
         ),
         # 批量大小
         'algo_cfgs:batch_size': trial.suggest_categorical(
@@ -104,15 +84,15 @@ def suggest_params(trial: 'optuna.Trial', algo: str) -> dict[str, Any]:
         ),
         # 目标网络软更新系数
         'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
-        # Lagrange 乘子学习率
-        'lagrange_cfgs:lambda_lr': trial.suggest_float(
-            'lambda_lr', 3e-4, 3e-3, log=True,
-        ),
         # Lagrange 乘子初始值
         'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
-            'lagrangian_multiplier_init', [0.01, 0.1, 0.5, 1.0],
+            'lagrangian_multiplier_init', [0.3, 0.693147, 1.0],
         ),
     }
+    params['model_cfgs:critic:lr'] = params['model_cfgs:actor:lr']
+    lr_scale = trial.suggest_categorical('cost_penalty_lr_scale', [1.0, 10.0, 50.0])
+    params['algo_cfgs:cost_penalty_lr_scale'] = lr_scale
+    params['lagrange_cfgs:lambda_lr'] = params['model_cfgs:actor:lr'] * lr_scale
     if algo == 'WCSAC_IQN':
         params.update({
             'algo_cfgs:iqn_n_quantiles': trial.suggest_categorical(
@@ -150,13 +130,25 @@ def make_custom_cfgs(
         'algo_cfgs': {
             'gamma': GAMMA,
             'alpha': ALPHA,
+            'auto_alpha': True,
+            'cost_normalize': False,
+            'policy_delay': 1,
+            'warmup_epochs': 0,
+            'max_ep_len': 1000,
+            'update_cycle': 100,
+            'update_iters': 100,
+            'start_learning_steps': 500,
+            'steps_per_epoch': 10000,
         },
         'model_cfgs': {
+            'weight_initialization_mode': 'xavier_uniform',
             'actor': {
                 'hidden_sizes': HIDDEN_SIZES,
+                'activation': 'relu',
             },
             'critic': {
                 'hidden_sizes': HIDDEN_SIZES,
+                'activation': 'relu',
             },
         },
         'logger_cfgs': {
@@ -220,8 +212,8 @@ def objective(
     # 按 trial 编号轮询分配 GPU
     gpu_id = gpus[trial.number % len(gpus)] if gpus else None
 
-    # 构建带参数名的目录，方便 TensorBoard 浏览
-    trial_dir = _build_trial_name(trial.number, params)
+    # TensorBoard 只用 trial 和 seed 区分运行，参数保留在 Optuna 中。
+    trial_dir = _build_trial_name(trial.number)
 
     rewards = []
     costs = []
@@ -289,7 +281,10 @@ def run_hpo_for_env(
     print(f'启动 HPO: {study_name}')
     print(f'Trials: {n_trials}  |  步数: {TOTAL_STEPS:,}  |  Seeds: {SEEDS}')
     print(f'GPU: {gpus}  |  并行: {n_jobs} jobs')
-    print(f'搜索参数: actor_lr, critic_lr, batch_size, polyak, lambda_lr, multiplier_init')
+    print(
+        '搜索参数: learning_rate, batch_size, polyak, '
+        'cost_penalty_lr_scale, multiplier_init',
+    )
     print(f'{"=" * 60}\n')
 
     study = optuna.create_study(
@@ -354,8 +349,19 @@ def main() -> None:
         gpus = []
         n_jobs = 1
     else:
-        gpus = [int(g.strip()) for g in args.gpus.split(',')] if args.gpus else AVAILABLE_GPUS
-        n_jobs = args.parallel if args.parallel else N_JOBS
+        import torch
+
+        available = list(range(torch.cuda.device_count()))
+        requested = (
+            [int(g.strip()) for g in args.gpus.split(',')]
+            if args.gpus
+            else AVAILABLE_GPUS
+        )
+        gpus = [gpu for gpu in requested if gpu in available]
+        n_jobs = args.parallel if args.parallel else min(N_JOBS, max(len(gpus), 1))
+        if not gpus:
+            print('未检测到可用 GPU，自动回退到 CPU。')
+            n_jobs = 1
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -382,12 +388,11 @@ def main() -> None:
             'gamma': GAMMA,
             'hidden_sizes': HIDDEN_SIZES,
             'search_params': [
-                'actor_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
-                'critic_lr: categorical [1e-5, 1e-4, 3e-4, 1e-3]',
+                'learning_rate: categorical [1e-4, 3e-4, 1e-3]',
                 'batch_size: categorical [64, 128, 256, 512]',
                 'polyak: uniform [0.001, 0.02]',
-                'lambda_lr: log-uniform [3e-4, 3e-3]',
-                'lagrangian_multiplier_init: categorical [0.01, 0.1, 0.5, 1.0]',
+                'cost_penalty_lr_scale: categorical [1, 10, 50]',
+                'lagrangian_multiplier_init: categorical [0.3, 0.693147, 1.0]',
                 # ---- WCSAC_IQN only ----
                 'iqn_n_quantiles: categorical [8, 16, 32, 64]',
                 'iqn_kappa: uniform [0.1, 2.0]',

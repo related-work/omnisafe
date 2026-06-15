@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from omnisafe.models.base import Critic
 from omnisafe.typing import Activation, InitFunction, OmnisafeSpace
+from omnisafe.utils.model import get_activation, initialize_layer
 
 
 class IQNCostCritic(Critic):
@@ -65,21 +66,15 @@ class IQNCostCritic(Critic):
         self._embedding_dim = embedding_dim
 
         # 将 (obs, act) 投影到 embedding_dim 维度，用于 Hadamard 积
-        self._obs_act_fc = nn.Linear(
-            self._obs_dim + self._act_dim, embedding_dim
-        )
+        self._obs_act_fc = nn.Linear(self._obs_dim + self._act_dim, embedding_dim)
 
         # 分位数 MLP: embedding_dim -> hidden -> 1
         layers: list[nn.Module] = []
         in_dim = embedding_dim
+        activation_fn = get_activation(activation)
         for h_dim in hidden_sizes:
             layers.append(nn.Linear(in_dim, h_dim))
-            if activation == 'relu':
-                layers.append(nn.ReLU())
-            elif activation == 'tanh':
-                layers.append(nn.Tanh())
-            else:
-                raise ValueError(f'Unsupported activation for IQNCostCritic: {activation}')
+            layers.append(activation_fn())
             in_dim = h_dim
         layers.append(nn.Linear(in_dim, 1))
         self._quantile_mlp = nn.Sequential(*layers)
@@ -88,20 +83,13 @@ class IQNCostCritic(Critic):
 
     def _init_weights(self, mode: InitFunction) -> None:
         """Initialize weights, with small uniform init for the final layer."""
-        # 初始化 obs-act 投影层
-        if mode == 'kaiming_uniform':
-            nn.init.kaiming_uniform_(self._obs_act_fc.weight, nonlinearity='relu')
-        elif mode == 'xavier_normal':
-            nn.init.xavier_normal_(self._obs_act_fc.weight)
+        initialize_layer(mode, self._obs_act_fc)
         if self._obs_act_fc.bias is not None:
             nn.init.constant_(self._obs_act_fc.bias, 0.0)
 
         for module in self._quantile_mlp:
             if isinstance(module, nn.Linear):
-                if mode == 'kaiming_uniform':
-                    nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
-                elif mode == 'xavier_normal':
-                    nn.init.xavier_normal_(module.weight)
+                initialize_layer(mode, module)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
         # 最后一层小范围均匀初始化，稳定训练初期

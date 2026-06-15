@@ -12,23 +12,27 @@ WCSAC / WCSAC_IQN on SafeMetaDrive 超参数自动搜索（Optuna）。
 """
 from __future__ import annotations
 
+import argparse
+import copy
 import os
-# ---- Panda3D headless: 必须在任何 MetaDrive import 之前 ----
-os.environ['PYTHON_OPTIMIZE'] = '2'
+from typing import Any
 
-def _force_panda3d_headless() -> None:
-    """强制 Panda3D 无头模式，允许多进程各自持有 ShowBase。"""
+# MetaDrive/Panda3D must be configured before importing OmniSafe.
+os.environ.setdefault('RENDER_OFFSCREEN', '1')
+
+
+def _configure_panda3d() -> None:
+    """Configure Panda3D before MetaDrive is imported."""
     try:
         from panda3d.core import loadPrcFileData
+
         loadPrcFileData('', 'window-type offscreen')
         loadPrcFileData('', 'audio-library-name null')
     except ImportError:
         pass
 
-_force_panda3d_headless()
 
-import argparse
-from typing import Any
+_configure_panda3d()
 
 import numpy as np
 import yaml
@@ -49,7 +53,7 @@ TOTAL_STEPS = 1_000_000
 # 每个 trial 的随机种子列表
 SEEDS = [111, 222, 333]
 
-# 默认 GPU 配置（MetaDrive 受 Panda3D ShowBase 限制，只能单进程）
+# MetaDrive uses a process-global Panda3D ShowBase, so run one trial per process.
 AVAILABLE_GPUS = list(range(8))
 N_JOBS = 1
 
@@ -62,7 +66,8 @@ OUTPUT_DIR = './hpo_results'
 # ---- 固定不变的参数 ----
 COST_LIMIT = 1.0     # 参考 on-policy 脚本
 GAMMA = 0.99
-HIDDEN_SIZES = [256, 256, 256]
+ALPHA = 0.693147
+HIDDEN_SIZES = [256, 256]
 
 # MetaDrive 环境固定参数（参考 run_onpolicy_safemetadrive_zn.py）
 METADRIVE_CONFIG = {
@@ -86,64 +91,29 @@ METADRIVE_CONFIG = {
 # 超参数搜索空间
 # ==============================================================================
 
-def _build_trial_name(trial_number: int, params: dict[str, Any]) -> str:
-    """构建含参数值的 trial 目录名。"""
-    alr = params['model_cfgs:actor:lr']
-    clr = params['model_cfgs:critic:lr']
-    bs = params['algo_cfgs:batch_size']
-    pk = params['algo_cfgs:polyak']
-    av = params['algo_cfgs:alpha']
-    mg = params['algo_cfgs:max_grad_norm']
-    llr = params['lagrange_cfgs:lambda_lr']
-    mi = params['lagrange_cfgs:lagrangian_multiplier_init']
-    name = (
-        f'trial_{trial_number:03d}_'
-        f'alr{alr:.0e}_clr{clr:.0e}_'
-        f'bs{bs}_pk{pk:.4f}_'
-        f'av{av:.2e}_mg{mg:.1f}_'
-        f'llr{llr:.2e}_mi{mi}'
-    )
-    if 'algo_cfgs:iqn_n_quantiles' in params:
-        nq = params['algo_cfgs:iqn_n_quantiles']
-        ed = params['model_cfgs:critic:iqn_embedding_dim']
-        name += f'_nq{nq}_ed{ed}'
-    return name
+def _build_trial_name(trial_number: int) -> str:
+    """构建简洁的 TensorBoard trial 目录名。"""
+    return f'trial_{trial_number:03d}'
 
 
 def suggest_params(trial: 'optuna.Trial', algo: str) -> dict[str, Any]:
-    """为一个 trial 采样超参数。WCSAC: 8 参数，WCSAC_IQN: 12 参数。"""
+    """Sample parameters while preserving the WCSAC optimizer relationships."""
     params = {
-        # Actor 学习率
         'model_cfgs:actor:lr': trial.suggest_categorical(
-            'actor_lr', [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
+            'learning_rate', [1e-4, 3e-4, 1e-3],
         ),
-        # Critic 学习率
-        'model_cfgs:critic:lr': trial.suggest_categorical(
-            'critic_lr', [1e-5, 3e-5, 1e-4, 3e-4, 1e-3],
-        ),
-        # 批量大小
         'algo_cfgs:batch_size': trial.suggest_categorical(
             'batch_size', [64, 128, 256, 512],
         ),
-        # 目标网络软更新系数
         'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
-        # SAC 温度系数（参考 on-policy entropy_coef=0.01）
-        'algo_cfgs:alpha': trial.suggest_categorical(
-            'alpha', [0.001, 0.005, 0.01, 0.05, 0.1, 0.2],
-        ),
-        # 梯度裁剪（参考 on-policy max_grad_norm=0.5）
-        'algo_cfgs:max_grad_norm': trial.suggest_categorical(
-            'max_grad_norm', [0.5, 1.0, 5.0, 10.0, 40.0],
-        ),
-        # Lagrange 乘子学习率
-        'lagrange_cfgs:lambda_lr': trial.suggest_float(
-            'lambda_lr', 1e-5, 1e-3, log=True,
-        ),
-        # Lagrange 乘子初始值
         'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
-            'lagrangian_multiplier_init', [0.001, 0.01, 0.1, 0.5, 1.0],
+            'lagrangian_multiplier_init', [0.3, 0.693147, 1.0],
         ),
     }
+    params['model_cfgs:critic:lr'] = params['model_cfgs:actor:lr']
+    lr_scale = trial.suggest_categorical('cost_penalty_lr_scale', [1.0, 10.0, 50.0])
+    params['algo_cfgs:cost_penalty_lr_scale'] = lr_scale
+    params['lagrange_cfgs:lambda_lr'] = params['model_cfgs:actor:lr'] * lr_scale
     if algo == 'WCSAC_IQN':
         params.update({
             'algo_cfgs:iqn_n_quantiles': trial.suggest_categorical(
@@ -179,16 +149,22 @@ def make_custom_cfgs(
         },
         'algo_cfgs': {
             'gamma': GAMMA,
-            'steps_per_epoch': 2_000,
+            'alpha': ALPHA,
+            'auto_alpha': True,
+            'steps_per_epoch': 10_000,
             'update_cycle': 100,
-            'update_iters': 200,
-            'reward_normalize': True,
-            'cost_normalize': True,
-            'warmup_epochs': 10,
+            'update_iters': 100,
+            'start_learning_steps': 500,
+            'reward_normalize': False,
+            'cost_normalize': False,
+            'policy_delay': 1,
+            'warmup_epochs': 0,
+            'max_ep_len': 1000,
         },
         'model_cfgs': {
-            'actor': {'hidden_sizes': HIDDEN_SIZES},
-            'critic': {'hidden_sizes': HIDDEN_SIZES},
+            'weight_initialization_mode': 'xavier_uniform',
+            'actor': {'hidden_sizes': HIDDEN_SIZES, 'activation': 'relu'},
+            'critic': {'hidden_sizes': HIDDEN_SIZES, 'activation': 'relu'},
         },
         'logger_cfgs': {
             'use_wandb': False,
@@ -202,7 +178,7 @@ def make_custom_cfgs(
             'cvar_alpha': 0.9,
         },
         'env_cfgs': {
-            'meta_drive_config': METADRIVE_CONFIG,
+            'meta_drive_config': copy.deepcopy(METADRIVE_CONFIG),
         },
         'seed': seed,
     }
@@ -278,7 +254,8 @@ def objective(
     """目标函数：3 种子取平均，cost 超标给惩罚。"""
     params = suggest_params(trial, algo)
     gpu_id = gpus[trial.number % len(gpus)] if gpus else None
-    trial_dir = _build_trial_name(trial.number, params)
+    # TensorBoard 只用 trial 和 seed 区分运行，参数保留在 Optuna 中。
+    trial_dir = _build_trial_name(trial.number)
 
     rewards = []
     costs = []
@@ -325,7 +302,8 @@ def objective(
     if all_md_metrics and all_md_metrics[0]:
         md_summary = '\n  MetaDrive: '
         md_summary += ' | '.join(
-            f'{key.split("/")[-1]}={np.nanmean([m.get(key, float("nan")) for m in all_md_metrics]):.3f}'
+            f'{key.split("/")[-1]}='
+            f'{np.nanmean([m.get(key, float("nan")) for m in all_md_metrics]):.3f}'
             for key in sorted(all_md_metrics[0].keys())
         )
 
@@ -362,7 +340,10 @@ def run_hpo(
     print(f'启动 HPO: {study_name}')
     print(f'Trials: {n_trials}  |  步数: {TOTAL_STEPS:,}  |  Seeds: {SEEDS}')
     print(f'GPU: {gpus}  |  并行: {n_jobs} jobs  |  cost_limit: {COST_LIMIT}')
-    print(f'搜索参数: actor_lr, critic_lr, batch_size, polyak, lambda_lr, multiplier_init')
+    print(
+        '搜索参数: learning_rate, batch_size, polyak, '
+        'cost_penalty_lr_scale, multiplier_init',
+    )
     print(f'{"=" * 60}\n')
 
     study = optuna.create_study(
@@ -411,7 +392,12 @@ def run_hpo(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='WCSAC/WCSAC_IQN HPO on SafeMetaDrive')
-    parser.add_argument('--algo', type=str, default=None, help='算法，逗号分隔（默认 WCSAC,WCSAC_IQN）')
+    parser.add_argument(
+        '--algo',
+        type=str,
+        default=None,
+        help='算法，逗号分隔（默认 WCSAC,WCSAC_IQN）',
+    )
     parser.add_argument('--trials', type=int, default=N_TRIALS, help='Trial 数')
     parser.add_argument('--gpus', type=str, default=None, help='GPU 编号，逗号分隔')
     parser.add_argument('--parallel', type=int, default=None, help='并行数')
@@ -424,8 +410,21 @@ def main() -> None:
         gpus = []
         n_jobs = 1
     else:
-        gpus = [int(g.strip()) for g in args.gpus.split(',')] if args.gpus else AVAILABLE_GPUS
+        import torch
+
+        available = list(range(torch.cuda.device_count()))
+        requested = (
+            [int(g.strip()) for g in args.gpus.split(',')]
+            if args.gpus
+            else AVAILABLE_GPUS
+        )
+        gpus = [gpu for gpu in requested if gpu in available]
         n_jobs = args.parallel if args.parallel else N_JOBS
+        if not gpus:
+            print('未检测到可用 GPU，自动回退到 CPU。')
+        if n_jobs != 1:
+            print('MetaDrive 使用进程级 Panda3D 状态，并行 trial 已强制设为 1。')
+            n_jobs = 1
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -451,14 +450,11 @@ def main() -> None:
             'hidden_sizes': HIDDEN_SIZES,
             'num_scenarios': METADRIVE_CONFIG['num_scenarios'],
             'search_params': [
-                'actor_lr: categorical [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]',
-                'critic_lr: categorical [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]',
+                'learning_rate: categorical [1e-4, 3e-4, 1e-3]',
                 'batch_size: categorical [64, 128, 256, 512]',
                 'polyak: uniform [0.001, 0.02]',
-                'alpha: categorical [0.001, 0.005, 0.01, 0.05, 0.1, 0.2]',
-                'max_grad_norm: categorical [0.5, 1.0, 5.0, 10.0, 40.0]',
-                'lambda_lr: log-uniform [1e-5, 1e-3]',
-                'lagrangian_multiplier_init: categorical [0.001, 0.01, 0.1, 0.5, 1.0]',
+                'cost_penalty_lr_scale: categorical [1, 10, 50]',
+                'lagrangian_multiplier_init: categorical [0.3, 0.693147, 1.0]',
                 # ---- WCSAC_IQN only ----
                 'iqn_n_quantiles: categorical [8, 16, 32, 64]',
                 'iqn_kappa: uniform [0.1, 2.0]',

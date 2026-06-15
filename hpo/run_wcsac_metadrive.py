@@ -8,12 +8,28 @@ WCSAC / WCSAC_IQN on SafeMetaDrive 单次启动脚本。
     python hpo/run_wcsac_metadrive.py --seed 42 --gpu 0
 """
 import argparse
+import copy
 import os
 
-# 必须在 import omnisafe 之前设置
-os.environ['RENDER_OFFSCREEN'] = '1'
+# Panda3D must be configured before importing OmniSafe/MetaDrive.
+os.environ.setdefault('RENDER_OFFSCREEN', '1')
+
+
+def _configure_panda3d() -> None:
+    """Configure Panda3D for headless training before MetaDrive is imported."""
+    try:
+        from panda3d.core import loadPrcFileData
+
+        loadPrcFileData('', 'window-type offscreen')
+        loadPrcFileData('', 'audio-library-name null')
+    except ImportError:
+        pass
+
+
+_configure_panda3d()
 
 import omnisafe
+import torch
 
 
 ENV_ID = 'SafeMetaDrive'
@@ -27,16 +43,23 @@ DEFAULT_CFGS = {
         'torch_threads': 1,
     },
     'algo_cfgs': {
-        'steps_per_epoch': 2_000,
+        'steps_per_epoch': 10_000,
         'update_cycle': 100,
-        'update_iters': 200,
-        'reward_normalize': True,
-        'cost_normalize': True,
-        'warmup_epochs': 10,
+        'update_iters': 100,
+        'start_learning_steps': 500,
+        'reward_normalize': False,
+        'cost_normalize': False,
+        'alpha': 0.693147,
+        'auto_alpha': True,
+        'policy_delay': 1,
+        'warmup_epochs': 0,
+        'max_ep_len': 1000,
+        'cost_penalty_lr_scale': 50.0,
     },
     'model_cfgs': {
-        'actor': {'hidden_sizes': [256, 256, 256], 'lr': 3e-4},
-        'critic': {'hidden_sizes': [256, 256, 256], 'lr': 1e-4},
+        'weight_initialization_mode': 'xavier_uniform',
+        'actor': {'hidden_sizes': [256, 256], 'activation': 'relu', 'lr': 1e-3},
+        'critic': {'hidden_sizes': [256, 256], 'activation': 'relu', 'lr': 1e-3},
     },
     'logger_cfgs': {
         'use_wandb': False,
@@ -46,8 +69,8 @@ DEFAULT_CFGS = {
     },
     'lagrange_cfgs': {
         'cost_limit': 1.0,
-        'lagrangian_multiplier_init': 0.01,
-        'lambda_lr': 1e-4,
+        'lagrangian_multiplier_init': 0.693147,
+        'lambda_lr': 0.05,
         'lambda_optimizer': 'Adam',
         'cvar_alpha': 0.9,
     },
@@ -78,9 +101,9 @@ def main() -> None:
     parser.add_argument('--steps', type=int, default=500_000, help='总训练步数')
     args = parser.parse_args()
 
-    import copy
     custom_cfgs = copy.deepcopy(DEFAULT_CFGS)
-    custom_cfgs['train_cfgs']['device'] = f'cuda:{args.gpu}'
+    use_cuda = torch.cuda.is_available() and args.gpu < torch.cuda.device_count()
+    custom_cfgs['train_cfgs']['device'] = f'cuda:{args.gpu}' if use_cuda else 'cpu'
     custom_cfgs['train_cfgs']['total_steps'] = args.steps
     custom_cfgs['seed'] = args.seed
 
@@ -92,7 +115,10 @@ def main() -> None:
         custom_cfgs['model_cfgs']['critic']['iqn_embedding_dim'] = 64
 
     print(f'启动: {args.algo} on {ENV_ID}')
-    print(f'  GPU: {args.gpu}  |  Seed: {args.seed}  |  Steps: {args.steps:,}')
+    print(
+        f'  Device: {custom_cfgs["train_cfgs"]["device"]}  '
+        f'|  Seed: {args.seed}  |  Steps: {args.steps:,}',
+    )
 
     agent = omnisafe.Agent(args.algo, ENV_ID, custom_cfgs=custom_cfgs)
     reward, cost, ep_len = agent.learn()
