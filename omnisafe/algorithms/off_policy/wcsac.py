@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import optim
 from torch.distributions import Normal
 from torch.nn.utils.clip_grad import clip_grad_norm_
 
 from omnisafe.algorithms import registry
+from omnisafe.algorithms.off_policy.ddpg import DDPG
 from omnisafe.algorithms.off_policy.sac import SAC
-from omnisafe.models.actor_critic.disconstraint_actor_q_critic import DisConstraintActorQCritic
+from omnisafe.models.actor_critic.wcsac_actor_q_critic import WCSACActorQCritic
 
 
 @registry.register
@@ -35,9 +36,9 @@ class WCSAC(SAC):
     This algorithm extends SAC-Lag by modeling the cost-return distribution as a Gaussian
     and using Conditional Value-at-Risk (CVaR) as the risk measure for constraint satisfaction.
 
-    The cost critic outputs (mu, var) where:
-    - mu: mean of cost Q-value
-    - var: variance of cost Q-value (ensuring non-negative via softplus)
+    The Gaussian cost return is represented by two independent critics:
+    - cost critic: mean of the cost return
+    - cost variance critic: variance of the cost return
 
     CVaR for Gaussian: CVaR_alpha = mu + sigma * phi(Phi^{-1}(alpha)) / (1 - alpha)
 
@@ -47,22 +48,22 @@ class WCSAC(SAC):
     """
 
     # 类内常量
-    _LAMBDA_MAX: float = 1000.0
-
-    _lagrange_multiplier: torch.Tensor
+    _soft_beta: torch.Tensor
+    _beta_optimizer: optim.Optimizer
+    _soft_alpha: torch.Tensor
+    _alpha_optimizer: optim.Optimizer
     _pdf_cdf: float  # CVaR 系数: phi(Phi^{-1}(alpha)) / (1 - alpha)
+    _cost_constraint: float
     _damp: float  # 阻尼项, 基于 real actions 的 CVaR 与 cost_limit 的差值
 
     def _init_model(self) -> None:
         """Initialize the model.
 
-        Uses DisConstraintActorQCritic with:
-        - reward_critic: dual Q-networks (num_critics=2) for SAC
-        - cost_critic: single Q-network with 2-dim output (mu, var_raw) for Gaussian
+        The original WCSAC uses separate networks for cost mean and variance.
         """
         self._cfgs.model_cfgs.critic['num_critics'] = 2
 
-        self._actor_critic = DisConstraintActorQCritic(
+        self._actor_critic = WCSACActorQCritic(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
             model_cfgs=self._cfgs.model_cfgs,
@@ -73,15 +74,40 @@ class WCSAC(SAC):
         """Initialize algorithm-specific components."""
         super()._init()
 
-        # 初始化 Lagrange 乘子
-        self._lagrange_multiplier = torch.tensor(
-            float(self._cfgs.lagrange_cfgs.lagrangian_multiplier_init),
+        # The reference code optimizes unconstrained parameters and maps them
+        # through softplus to obtain positive alpha and beta.
+        beta_init = float(self._cfgs.lagrange_cfgs.lagrangian_multiplier_init)
+        self._soft_beta = torch.tensor(
+            self._inverse_softplus(beta_init),
             device=self._device,
+            requires_grad=True,
         )
+        self._beta_optimizer = optim.Adam(
+            [self._soft_beta],
+            lr=(
+                float(self._cfgs.model_cfgs.actor.lr)
+                * float(self._cfgs.algo_cfgs.get('cost_penalty_lr_scale', 50.0))
+            ),
+        )
+
+        alpha_init = float(self._cfgs.algo_cfgs.alpha)
+        self._soft_alpha = torch.tensor(
+            self._inverse_softplus(alpha_init),
+            device=self._device,
+            requires_grad=True,
+        )
+        assert self._cfgs.model_cfgs.actor.lr is not None
+        self._alpha_optimizer = optim.Adam(
+            [self._soft_alpha],
+            lr=float(self._cfgs.model_cfgs.actor.lr),
+        )
+        self._target_entropy = -torch.prod(torch.Tensor(self._env.action_space.shape)).item()
 
         # 计算 CVaR 系数: phi(Phi^{-1}(alpha)) / (1 - alpha)
         # 其中 alpha 是风险水平（如 0.5 表示关注上 50% 的尾部风险）
         alpha = float(self._cfgs.lagrange_cfgs.cvar_alpha)
+        if not 0.0 < alpha < 1.0:
+            raise ValueError('cvar_alpha must be strictly between 0 and 1')
         normal = Normal(
             loc=torch.tensor(0.0),
             scale=torch.tensor(1.0),
@@ -91,8 +117,33 @@ class WCSAC(SAC):
         phi_z_alpha = torch.exp(normal.log_prob(z_alpha))
         self._pdf_cdf = (phi_z_alpha / (1.0 - alpha)).item()
 
-        # 阻尼项，基于 real actions 的 CVaR 与 cost_limit 的差值
+        max_ep_len = int(self._cfgs.algo_cfgs.get('max_ep_len', 1000))
+        gamma = float(self._cfgs.algo_cfgs.gamma)
+        if gamma == 1.0:
+            raise ValueError('WCSAC cost-limit conversion requires gamma < 1')
+        self._cost_constraint = (
+            float(self._cfgs.lagrange_cfgs.cost_limit)
+            * (1.0 - gamma**max_ep_len)
+            / (1.0 - gamma)
+            / max_ep_len
+        )
         self._damp = 0.0
+
+    @staticmethod
+    def _inverse_softplus(value: float) -> float:
+        """Return x such that softplus(x) is approximately ``value``."""
+        value = max(value, 1e-8)
+        return torch.log(torch.expm1(torch.tensor(value))).item()
+
+    @property
+    def _alpha(self) -> float:
+        """Return the positive entropy coefficient."""
+        return F.softplus(self._soft_alpha).item()
+
+    @property
+    def _lagrange_multiplier(self) -> torch.Tensor:
+        """Return the positive WCSAC cost penalty."""
+        return F.softplus(self._soft_beta)
 
     def _init_log(self) -> None:
         """Register logging keys for WCSAC-specific metrics."""
@@ -108,25 +159,35 @@ class WCSAC(SAC):
 
     def _get_cost_dist_params(
         self,
-        cost_critic: nn.Module,
         obs: torch.Tensor,
         act: torch.Tensor,
+        *,
+        target: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract Gaussian distribution parameters from cost critic output.
 
         Args:
-            cost_critic: The cost critic network (current or target).
             obs: Observation tensor of shape (B, obs_dim).
             act: Action tensor of shape (B, act_dim).
+            target: Whether to use target cost critics.
 
         Returns:
             mu: Mean of cost Q-value, shape (B, 1).
             var: Variance of cost Q-value, shape (B, 1), always positive.
         """
-        q_out = cost_critic(obs, act)[0]  # [B, 2]
-        mu = q_out[:, 0:1]  # [B, 1]
-        var_raw = q_out[:, 1:2]  # [B, 1]
-        var = F.softplus(var_raw) + 1e-8  # 保证正数
+        mean_critic = (
+            self._actor_critic.target_cost_critic
+            if target
+            else self._actor_critic.cost_critic
+        )
+        var_critic = (
+            self._actor_critic.target_cost_var_critic
+            if target
+            else self._actor_critic.cost_var_critic
+        )
+        mu = mean_critic(obs, act)[0].unsqueeze(-1)
+        var = F.softplus(var_critic(obs, act)[0]).unsqueeze(-1)
+        var = torch.clamp(var, min=1e-8, max=1e8)
         return mu, var
 
     def _gaussian_cvar(
@@ -152,18 +213,72 @@ class WCSAC(SAC):
     # ==================== 主更新循环 ====================
 
     def _update(self) -> None:
-        """Update actor, critic, and Lagrange multiplier."""
-        super()._update()
-
-        # 更新 Lagrange 乘子（仅在 warmup 后）
-        if self._cfgs.algo_cfgs.use_cost:
+        """Run the reference WCSAC update order on replay-buffer batches."""
+        for _ in range(self._cfgs.algo_cfgs.update_iters):
             data = self._buf.sample_batch()
-            obs = data['obs']
+            self._update_count += 1
+            obs, act, reward, cost, done, next_obs = (
+                data['obs'],
+                data['act'],
+                data['reward'],
+                data['cost'],
+                data['done'],
+                data['next_obs'],
+            )
 
-            if self._epoch > self._cfgs.algo_cfgs.warmup_epochs:
-                self._update_lagrange_multiplier_wccvar(obs)
-            else:
-                self._log_lagrange_when_warmup(obs)
+            self._update_actor(obs)
+            self._update_reward_critic(obs, act, reward, done, next_obs)
+            if self._cfgs.algo_cfgs.use_cost:
+                self._update_cost_critic(obs, act, cost, done, next_obs)
+            self._update_alpha(obs)
+            if self._cfgs.algo_cfgs.use_cost:
+                self._update_beta(obs, act)
+            self._actor_critic.polyak_update(self._cfgs.algo_cfgs.polyak)
+
+    def _update_actor(self, obs: torch.Tensor) -> None:
+        """Update only the policy; alpha is updated later in reference order."""
+        DDPG._update_actor(self, obs)
+
+    def _update_reward_critic(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+        next_obs: torch.Tensor,
+    ) -> None:
+        """Update both reward critics with the reference WCSAC loss scale."""
+        with torch.no_grad():
+            next_action = self._actor_critic.actor.predict(next_obs, deterministic=False)
+            next_logp = self._actor_critic.actor.log_prob(next_action)
+            next_q1, next_q2 = self._actor_critic.target_reward_critic(
+                next_obs,
+                next_action,
+            )
+            next_q = torch.min(next_q1, next_q2) - self._alpha * next_logp
+            target_q = reward + self._cfgs.algo_cfgs.gamma * (1 - done) * next_q
+
+        q1, q2 = self._actor_critic.reward_critic(obs, action)
+        loss = 0.5 * F.mse_loss(q1, target_q) + 0.5 * F.mse_loss(q2, target_q)
+
+        if self._cfgs.algo_cfgs.use_critic_norm:
+            for param in self._actor_critic.reward_critic.parameters():
+                loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coeff
+
+        self._actor_critic.reward_critic_optimizer.zero_grad()
+        loss.backward()
+        if self._cfgs.algo_cfgs.max_grad_norm:
+            clip_grad_norm_(
+                self._actor_critic.reward_critic.parameters(),
+                self._cfgs.algo_cfgs.max_grad_norm,
+            )
+        self._actor_critic.reward_critic_optimizer.step()
+        self._logger.store(
+            {
+                'Loss/Loss_reward_critic': loss.item(),
+                'Value/reward_critic': q1.mean().item(),
+            },
+        )
 
     # ==================== Cost Critic 更新 ====================
 
@@ -194,22 +309,14 @@ class WCSAC(SAC):
             next_action = self._actor_critic.actor.predict(next_obs, deterministic=False)
 
             # 从 target cost critic 获取分布参数
-            next_mu, next_var = self._get_cost_dist_params(
-                self._actor_critic.target_cost_critic,
-                next_obs,
-                next_action,
-            )
+            next_mu, next_var = self._get_cost_dist_params(next_obs, next_action, target=True)
 
             # Mean target: standard Bellman
             target_mu = cost + self._cfgs.algo_cfgs.gamma * (1 - done) * next_mu
 
             # 获取当前 qc（用于方差 target 计算）
             # 注意：这里需要用当前网络的 mu，而不是 target
-            curr_mu, _ = self._get_cost_dist_params(
-                self._actor_critic.cost_critic,
-                obs,
-                action,
-            )
+            curr_mu, _ = self._get_cost_dist_params(obs, action)
 
             # Variance target (基于二阶矩推导)
             # Var_backup = c² + 2γc·next_mu + γ²·next_var + γ²·next_mu² - curr_mu²
@@ -221,21 +328,17 @@ class WCSAC(SAC):
                 + gamma**2 * next_mu.pow(2)
                 - curr_mu.pow(2)
             )
-            target_var = torch.clamp(target_var, min=1e-8)  # 确保正数
+            target_var = torch.clamp(target_var, min=1e-8, max=1e8)
 
         # 当前 cost critic 的分布参数
-        mu, var = self._get_cost_dist_params(
-            self._actor_critic.cost_critic,
-            obs,
-            action,
-        )
+        mu, var = self._get_cost_dist_params(obs, action)
 
         # 数值检查
         if not torch.isfinite(mu).all() or not torch.isfinite(var).all():
             raise RuntimeError('cost_critic outputs NaN/Inf')
 
         # Mean loss: MSE
-        loss_mu = F.mse_loss(mu, target_mu)
+        loss_mu = 0.5 * F.mse_loss(mu, target_mu)
 
         # Variance loss: Wasserstein-style distance
         # L_var = 0.5 * E[var + target_var - 2 * sqrt(var * target_var)]
@@ -243,25 +346,31 @@ class WCSAC(SAC):
 
         # 计算阻尼项 (基于 real actions 的 CVaR 与 cost_limit 的差值)
         damp_scale = float(self._cfgs.algo_cfgs.get('damp_scale', 10.0))
-        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
         cvar_real = self._gaussian_cvar(mu.detach(), var.detach())
-        self._damp = damp_scale * (cost_limit - cvar_real.mean()).item()
+        self._damp = damp_scale * (self._cost_constraint - cvar_real.mean()).item()
 
         loss = loss_mu + loss_var
 
         if self._cfgs.algo_cfgs.use_critic_norm:
-            for param in self._actor_critic.cost_critic.parameters():
-                loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coeff
+            for critic in (
+                self._actor_critic.cost_critic,
+                self._actor_critic.cost_var_critic,
+            ):
+                for param in critic.parameters():
+                    loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coeff
 
         self._actor_critic.cost_critic_optimizer.zero_grad()
+        self._actor_critic.cost_var_critic_optimizer.zero_grad()
         loss.backward()
 
         if self._cfgs.algo_cfgs.max_grad_norm:
             clip_grad_norm_(
-                self._actor_critic.cost_critic.parameters(),
+                list(self._actor_critic.cost_critic.parameters())
+                + list(self._actor_critic.cost_var_critic.parameters()),
                 self._cfgs.algo_cfgs.max_grad_norm,
             )
         self._actor_critic.cost_critic_optimizer.step()
+        self._actor_critic.cost_var_critic_optimizer.step()
 
         self._logger.store(
             {
@@ -292,98 +401,60 @@ class WCSAC(SAC):
         loss_cost = torch.zeros_like(loss_reward)
 
         if self._cfgs.algo_cfgs.use_cost:
-            mu, var = self._get_cost_dist_params(
-                self._actor_critic.cost_critic,
-                obs,
-                action,
-            )
+            mu, var = self._get_cost_dist_params(obs, action)
 
             if torch.isfinite(mu).all() and torch.isfinite(var).all():
                 cvar = self._gaussian_cvar(mu, var)
 
                 if torch.isfinite(cvar).all():
-                    loss_cost = (self._lagrange_multiplier - self._damp) * cvar
+                    loss_cost = (
+                        self._lagrange_multiplier.detach() - self._damp
+                    ) * cvar.squeeze(-1)
 
         total_loss = (loss_entropy + loss_reward + loss_cost).mean()
 
         return total_loss
 
-    # ==================== Lagrange 乘子更新 ====================
+    def _update_alpha(self, obs: torch.Tensor) -> None:
+        """Update entropy coefficient as in the reference implementation."""
+        action = self._actor_critic.actor.predict(obs, deterministic=False)
+        log_prob = self._actor_critic.actor.log_prob(action).detach()
+        entropy = -log_prob.mean()
+        alpha_loss = -F.softplus(self._soft_alpha) * (self._target_entropy - entropy)
 
-    def _update_lagrange_multiplier_wccvar(self, obs: torch.Tensor) -> None:
-        """Update Lagrange multiplier based on CVaR constraint violation."""
-        cost_limit = float(self._cfgs.lagrange_cfgs.cost_limit)
-        lambda_lr = float(self._cfgs.lagrange_cfgs.lambda_lr)
+        self._alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self._alpha_optimizer.step()
+        self._logger.store(
+            {
+                'Loss/alpha_loss': alpha_loss.item(),
+                'Value/alpha': self._alpha,
+            },
+        )
 
+    def _update_beta(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+    ) -> None:
+        """Update the softplus cost penalty using replay-buffer actions."""
         with torch.no_grad():
-            action = self._actor_critic.actor.predict(obs, deterministic=False)
-
-            mu, var = self._get_cost_dist_params(
-                self._actor_critic.cost_critic,
-                obs,
-                action,
-            )
-
-            if not torch.isfinite(mu).all() or not torch.isfinite(var).all():
-                self._logger.store(
-                    {
-                        'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
-                        'Value/wccvar': 0.0,
-                    },
-                )
-                return
-
+            mu, var = self._get_cost_dist_params(obs, action)
             cvar = self._gaussian_cvar(mu, var)
-            if cvar.dim() == 2:
-                cvar = cvar.squeeze(-1)
 
-            if not torch.isfinite(cvar).all():
-                self._logger.store(
-                    {
-                        'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
-                        'Value/wccvar': 0.0,
-                    },
-                )
-                return
+        beta_loss = (
+            F.softplus(self._soft_beta) * (self._cost_constraint - cvar)
+        ).mean()
+        self._beta_optimizer.zero_grad()
+        beta_loss.backward()
+        self._beta_optimizer.step()
 
-            J = cvar.mean()
-            gap = J - cost_limit
-
-            self._lagrange_multiplier = torch.clamp(
-                self._lagrange_multiplier + lambda_lr * gap,
-                min=0.0,
-                max=self._LAMBDA_MAX,
-            )
-
-            self._logger.store(
-                {
-                    'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
-                    'Value/wccvar': J.item(),
-                },
-            )
-
-    def _log_lagrange_when_warmup(self, obs: torch.Tensor) -> None:
-        """Log Lagrange-related metrics during warmup (without updating λ)."""
-        with torch.no_grad():
-            action = self._actor_critic.actor.predict(obs, deterministic=False)
-            mu, var = self._get_cost_dist_params(
-                self._actor_critic.cost_critic,
-                obs,
-                action,
-            )
-
-            cvar_val = 0.0
-            if torch.isfinite(mu).all() and torch.isfinite(var).all():
-                cvar = self._gaussian_cvar(mu, var)
-                if torch.isfinite(cvar).all():
-                    cvar_val = cvar.mean().item()
-
-            self._logger.store(
-                {
-                    'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
-                    'Value/wccvar': cvar_val,
-                },
-            )
+        self._logger.store(
+            {
+                'Value/lagrange_multiplier': self._lagrange_multiplier.item(),
+                'Value/wccvar': cvar.mean().item(),
+            },
+        )
 
     # ==================== 其他辅助方法 ====================
 

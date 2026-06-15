@@ -36,6 +36,22 @@ if __name__ == '__main__':
     # ---- 训练参数 ----
     eg.add('train_cfgs:torch_threads', [1])
     eg.add('train_cfgs:total_steps', [1_000_000])
+    eg.add('algo_cfgs:steps_per_epoch', [10_000])
+    eg.add('algo_cfgs:update_cycle', [100])
+    eg.add('algo_cfgs:update_iters', [100])
+    eg.add('algo_cfgs:start_learning_steps', [500])
+    eg.add('algo_cfgs:cost_normalize', [False])
+    eg.add('algo_cfgs:alpha', [0.693147])
+    eg.add('algo_cfgs:cost_penalty_lr_scale', [50.0])
+    eg.add('model_cfgs:weight_initialization_mode', ['xavier_uniform'])
+    eg.add('model_cfgs:actor:hidden_sizes', [[256, 256]])
+    eg.add('model_cfgs:actor:activation', ['relu'])
+    eg.add('model_cfgs:actor:lr', [1e-3])
+    eg.add('model_cfgs:critic:hidden_sizes', [[256, 256]])
+    eg.add('model_cfgs:critic:activation', ['relu'])
+    eg.add('model_cfgs:critic:lr', [1e-3])
+    eg.add('lagrange_cfgs:lagrangian_multiplier_init', [0.693147])
+    eg.add('lagrange_cfgs:cvar_alpha', [0.9])
 
     # ---- GPU 配置 ----
     avaliable_gpus = list(range(torch.cuda.device_count()))

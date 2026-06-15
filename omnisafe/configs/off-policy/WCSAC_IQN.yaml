@@ -5,12 +5,6 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # ==============================================================================
 
 defaults:
@@ -20,34 +14,35 @@ defaults:
     torch_threads: 16
     vector_env_nums: 1
     parallel: 1
-    total_steps: 1000000
+    total_steps: 3000000
     eval_episodes: 1
   algo_cfgs:
-    steps_per_epoch: 2000
-    update_cycle: 1
-    update_iters: 1
+    steps_per_epoch: 30000
+    update_cycle: 100
+    update_iters: 100
     size: 1000000
     batch_size: 256
     reward_normalize: False
-    cost_normalize: True
+    cost_normalize: False
     obs_normalize: False
-    max_grad_norm: 40
+    max_grad_norm: 0
     use_critic_norm: False
     critic_norm_coeff: 0.001
     polyak: 0.005
     gamma: 0.99
-    start_learning_steps: 10000
-    policy_delay: 2
+    start_learning_steps: 500
+    policy_delay: 1
     use_exploration_noise: False
     exploration_noise: 0.1
     policy_noise: 0.2
     policy_noise_clip: 0.5
-    alpha: 0.2
-    auto_alpha: False
+    alpha: 0.693147
+    auto_alpha: True
     use_cost: True
-    warmup_epochs: 100
+    warmup_epochs: 0
     damp_scale: 10.0
-    # ====== IQN 专用参数 ======
+    cost_penalty_lr_scale: 50.0
+    max_ep_len: 1000
     iqn_n_quantiles: 32
     iqn_kappa: 1.0
     cvar_quantile_samples: 32
@@ -59,88 +54,42 @@ defaults:
     log_dir: "./runs"
     window_lens: 10
   model_cfgs:
-    weight_initialization_mode: "kaiming_uniform"
+    weight_initialization_mode: "xavier_uniform"
     actor_type: gaussian_sac
     linear_lr_decay: False
     actor:
       hidden_sizes: [256, 256]
-      activation: tanh
-      lr: 0.0003
+      activation: relu
+      lr: 0.001
     critic:
       num_critics: 2
       hidden_sizes: [256, 256]
-      activation: tanh
-      lr: 0.0003
+      activation: relu
+      lr: 0.001
       iqn_embedding_dim: 64
   lagrange_cfgs:
-    # cost_limit: 25.0
     cost_limit: 5.0
-    lagrangian_multiplier_init: 0.001
-    lambda_lr: 0.00001
+    lagrangian_multiplier_init: 0.693147
+    lambda_lr: 0.05
     lambda_optimizer: "Adam"
     cvar_alpha: 0.9
 
-
-SafetyCarCircle1-v0:
-  algo_cfgs:
-    alpha: 0.00001
-    cost_normalize: False
-  model_cfgs:
-    actor:
-      lr: 0.000005
-    critic:
-      lr: 0.001
-  lagrange_cfgs:
-    cost_limit: 5.0
-    # cost_limit: 25.0
-    lagrangian_multiplier_init: 0.000
-    lambda_lr: 0.0000005
-    lambda_optimizer: "Adam"
-
-SafetyCarGoal1-v0:
-  algo_cfgs:
-    alpha: 0.00001
-    cost_normalize: False
-  model_cfgs:
-    actor:
-      lr: 0.000005
-    critic:
-      lr: 0.001
-  lagrange_cfgs:
-    cost_limit: 5.0
-    # cost_limit: 25.0
-    lagrangian_multiplier_init: 0.000
-    lambda_lr: 0.0000005
-    lambda_optimizer: "Adam"
-
-SafetyPointCircle1-v0:
-  algo_cfgs:
-    alpha: 0.00001
-    cost_normalize: False
-  model_cfgs:
-    actor:
-      lr: 0.000005
-    critic:
-      lr: 0.001
-  lagrange_cfgs:
-    # cost_limit: 25.0
-    cost_limit: 5.0
-    lagrangian_multiplier_init: 0.000
-    lambda_lr: 0.0000005
-    lambda_optimizer: "Adam"
-
-SafetyPointGoal1-v0:
-  algo_cfgs:
-    alpha: 0.00001
-    cost_normalize: False
-  model_cfgs:
-    actor:
-      lr: 0.000005
-    critic:
-      lr: 0.001
-  lagrange_cfgs:
-    # cost_limit: 25.0
-    cost_limit: 5.0
-    lagrangian_multiplier_init: 0.000
-    lambda_lr: 0.0000005
-    lambda_optimizer: "Adam"
+SafeMetaDrive:
+  env_cfgs:
+    meta_drive_config:
+      horizon: 1000
+      num_scenarios: 100
+      accident_prob: 0.1
+      traffic_density: 0.10
+      crash_vehicle_cost: 1.0
+      crash_object_cost: 1.0
+      out_of_road_cost: 1.0
+      start_seed: 1000
+      crash_vehicle_done: false
+      crash_object_done: false
+      truncate_as_terminate: false
+      image_observation: false
+      vehicle_config:
+        lidar:
+          num_lasers: 240
+          distance: 50
