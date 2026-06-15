@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import yaml
@@ -155,7 +155,8 @@ def make_custom_cfgs(
             'use_wandb': False,
             'use_tensorboard': True,
             'log_dir': log_dir,
-            'save_model_freq': 10_000_000,
+            # 50 epochs * 10,000 steps_per_epoch = 500,000 environment steps.
+            'save_model_freq': 50,
         },
         'lagrange_cfgs': {
             'cost_limit': COST_LIMIT,
@@ -205,9 +206,14 @@ def objective(
     env_id: str,
     base_log_dir: str,
     gpus: list[int],
+    param_suggester: Callable[[Any], dict[str, Any]] | None = None,
 ) -> float:
     """目标函数：3 个种子取平均，cost 超标时给惩罚。"""
-    params = suggest_params(trial, algo)
+    params = (
+        param_suggester(trial)
+        if param_suggester is not None
+        else suggest_params(trial, algo)
+    )
 
     # 按 trial 编号轮询分配 GPU
     gpu_id = gpus[trial.number % len(gpus)] if gpus else None
@@ -270,6 +276,7 @@ def run_hpo_for_env(
     output_dir: str,
     gpus: list[int],
     n_jobs: int,
+    param_suggester: Callable[[Any], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """对单个 (algo, env_id) 组合运行 HPO。"""
     import optuna
@@ -299,7 +306,14 @@ def run_hpo_for_env(
     os.makedirs(base_log_dir, exist_ok=True)
 
     study.optimize(
-        lambda trial: objective(trial, algo, env_id, base_log_dir, gpus),
+        lambda trial: objective(
+            trial,
+            algo,
+            env_id,
+            base_log_dir,
+            gpus,
+            param_suggester,
+        ),
         n_trials=n_trials,
         n_jobs=n_jobs,
         show_progress_bar=True,

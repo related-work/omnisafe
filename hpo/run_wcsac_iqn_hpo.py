@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Optuna search dedicated to WCSAC-IQN."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from typing import Any
+
+import torch
+import yaml
+
+from hpo import run_wcsac_hpo as common
+
+
+ALGO = 'WCSAC_IQN'
+
+
+def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
+    """Sample WCSAC-IQN and distributional critic hyperparameters."""
+    learning_rate = trial.suggest_categorical(
+        'learning_rate',
+        [1e-4, 3e-4, 1e-3],
+    )
+    lr_scale = trial.suggest_categorical(
+        'cost_penalty_lr_scale',
+        [1.0, 10.0, 50.0],
+    )
+    return {
+        'model_cfgs:actor:lr': learning_rate,
+        'model_cfgs:critic:lr': learning_rate,
+        'algo_cfgs:batch_size': trial.suggest_categorical(
+            'batch_size',
+            [64, 128, 256, 512],
+        ),
+        'algo_cfgs:polyak': trial.suggest_float('polyak', 0.001, 0.02),
+        'algo_cfgs:cost_penalty_lr_scale': lr_scale,
+        'lagrange_cfgs:lambda_lr': learning_rate * lr_scale,
+        'lagrange_cfgs:lagrangian_multiplier_init': trial.suggest_categorical(
+            'lagrangian_multiplier_init',
+            [0.3, 0.693147, 1.0],
+        ),
+        'algo_cfgs:iqn_n_quantiles': trial.suggest_categorical(
+            'iqn_n_quantiles',
+            [8, 16, 32, 64],
+        ),
+        'algo_cfgs:iqn_kappa': trial.suggest_float('iqn_kappa', 0.1, 2.0),
+        'algo_cfgs:cvar_quantile_samples': trial.suggest_categorical(
+            'cvar_quantile_samples',
+            [8, 16, 32, 64],
+        ),
+        'model_cfgs:critic:iqn_embedding_dim': trial.suggest_categorical(
+            'iqn_embedding_dim',
+            [32, 64, 128],
+        ),
+    }
+
+
+def _resolve_devices(args: argparse.Namespace) -> tuple[list[int], int]:
+    """Resolve available GPUs and Optuna worker count."""
+    if args.cpu:
+        return [], 1
+
+    available = set(range(torch.cuda.device_count()))
+    requested = (
+        [int(gpu.strip()) for gpu in args.gpus.split(',')]
+        if args.gpus
+        else common.AVAILABLE_GPUS
+    )
+    gpus = [gpu for gpu in requested if gpu in available]
+    if not gpus:
+        print('未检测到可用 GPU，自动回退到 CPU。')
+        return [], 1
+    n_jobs = args.parallel if args.parallel else min(common.N_JOBS, len(gpus))
+    return gpus, n_jobs
+
+
+def main() -> None:
+    """Run WCSAC-IQN HPO."""
+    parser = argparse.ArgumentParser(description='WCSAC-IQN HPO with Optuna')
+    parser.add_argument('--env', default='SafetyPointCircle2-v0', help='环境，逗号分隔')
+    parser.add_argument('--trials', type=int, default=common.N_TRIALS)
+    parser.add_argument('--gpus', default=None, help='GPU 编号，逗号分隔')
+    parser.add_argument('--parallel', type=int, default=None)
+    parser.add_argument('--cpu', action='store_true')
+    args = parser.parse_args()
+
+    envs = [env.strip() for env in args.env.split(',')]
+    gpus, n_jobs = _resolve_devices(args)
+    os.makedirs(common.OUTPUT_DIR, exist_ok=True)
+
+    results = [
+        common.run_hpo_for_env(
+            ALGO,
+            env_id,
+            args.trials,
+            common.OUTPUT_DIR,
+            gpus,
+            n_jobs,
+            param_suggester=suggest_params,
+        )
+        for env_id in envs
+    ]
+    summary_path = os.path.join(common.OUTPUT_DIR, 'wcsac_iqn_hpo_summary.yaml')
+    with open(summary_path, 'w', encoding='utf-8') as file:
+        yaml.safe_dump(results, file, allow_unicode=True, sort_keys=False)
+    print(f'WCSAC-IQN HPO 完成，结果保存到 {summary_path}')
+
+
+if __name__ == '__main__':
+    main()

@@ -170,7 +170,8 @@ def make_custom_cfgs(
             'use_wandb': False,
             'use_tensorboard': True,
             'log_dir': log_dir,
-            'save_model_freq': 10_000_000,
+            # 50 epochs * 10,000 steps_per_epoch = 500,000 environment steps.
+            'save_model_freq': 50,
         },
         'lagrange_cfgs': {
             'cost_limit': COST_LIMIT,

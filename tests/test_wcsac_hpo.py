@@ -1,6 +1,11 @@
 """Tests for WCSAC HPO configuration generation."""
 
-from hpo import run_wcsac_hpo, run_wcsac_metadrive_hpo
+from hpo import (
+    run_wcsac_gaussian_hpo,
+    run_wcsac_hpo,
+    run_wcsac_iqn_hpo,
+    run_wcsac_metadrive_hpo,
+)
 
 
 class FakeTrial:
@@ -20,6 +25,7 @@ def _assert_common_cfg(cfg) -> None:
     assert cfg['algo_cfgs']['alpha'] == 0.693147
     assert cfg['algo_cfgs']['update_cycle'] == 100
     assert cfg['algo_cfgs']['update_iters'] == 100
+    assert cfg['logger_cfgs']['save_model_freq'] == 50
     assert cfg['model_cfgs']['weight_initialization_mode'] == 'xavier_uniform'
     assert cfg['model_cfgs']['actor']['activation'] == 'relu'
     assert cfg['model_cfgs']['critic']['activation'] == 'relu'
@@ -44,6 +50,16 @@ def test_general_hpo_builds_valid_iqn_config() -> None:
 def test_hpo_tensorboard_names_only_include_trial_and_seed() -> None:
     assert run_wcsac_hpo._build_trial_name(7) == 'trial_007'
     assert run_wcsac_metadrive_hpo._build_trial_name(12) == 'trial_012'
+
+
+def test_gaussian_and_iqn_use_separate_search_spaces() -> None:
+    gaussian = run_wcsac_gaussian_hpo.suggest_params(FakeTrial())
+    iqn = run_wcsac_iqn_hpo.suggest_params(FakeTrial())
+
+    assert 'algo_cfgs:iqn_n_quantiles' not in gaussian
+    assert 'model_cfgs:critic:iqn_embedding_dim' not in gaussian
+    assert iqn['algo_cfgs:iqn_n_quantiles'] == 8
+    assert iqn['model_cfgs:critic:iqn_embedding_dim'] == 32
 
 
 def test_metadrive_hpo_builds_valid_iqn_config() -> None:
