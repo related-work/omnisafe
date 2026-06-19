@@ -426,6 +426,11 @@ def main() -> None:
     parser.add_argument('--gpus', type=str, default=None, help='GPU 编号，逗号分隔（默认 0-7）')
     parser.add_argument('--parallel', type=int, default=None, help='并行 trial 数（默认 8）')
     parser.add_argument('--cpu', action='store_true', help='强制使用 CPU')
+    parser.add_argument(
+        '--run-id',
+        default=None,
+        help='运行标识，传入后结果存到 OUTPUT_DIR/<run-id>/ 子目录，与历史运行隔离',
+    )
     args = parser.parse_args()
 
     algos = [a.strip() for a in args.algo.split(',')] if args.algo else ALGOS
@@ -450,7 +455,10 @@ def main() -> None:
             print('未检测到可用 GPU，自动回退到 CPU。')
             n_jobs = 1
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_dir = (
+        os.path.join(OUTPUT_DIR, args.run_id) if args.run_id else OUTPUT_DIR
+    )
+    os.makedirs(output_dir, exist_ok=True)
 
     print(f'GPU 分配: {gpus if gpus else "CPU"}')
     print(f'并行数:   {n_jobs}')
@@ -461,7 +469,7 @@ def main() -> None:
 
     for algo in algos:
         for env_id in envs:
-            result = run_hpo_for_env(algo, env_id, n_trials, OUTPUT_DIR, gpus, n_jobs)
+            result = run_hpo_for_env(algo, env_id, n_trials, output_dir, gpus, n_jobs)
             all_results.append(result)
 
     # ---- 汇总保存 ----
@@ -502,7 +510,7 @@ def main() -> None:
         ],
     }
 
-    summary_path = os.path.join(OUTPUT_DIR, 'hpo_summary.yaml')
+    summary_path = os.path.join(output_dir, 'hpo_summary.yaml')
     with open(summary_path, 'w', encoding='utf-8') as f:
         yaml.dump(summary, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 

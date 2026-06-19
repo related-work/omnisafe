@@ -96,18 +96,28 @@ def main() -> None:
     parser.add_argument('--parallel', type=int, default=None)
     parser.add_argument('--seed-workers', type=int, default=len(common.SEEDS))
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument(
+        '--run-id',
+        default=None,
+        help='运行标识，传入后结果存到 OUTPUT_DIR/<run-id>/ 子目录，与历史运行隔离',
+    )
     args = parser.parse_args()
 
     envs = [env.strip() for env in args.env.split(',')]
     gpus, n_jobs, seed_workers = _resolve_devices(args)
-    os.makedirs(common.OUTPUT_DIR, exist_ok=True)
+    output_dir = (
+        os.path.join(common.OUTPUT_DIR, args.run_id)
+        if args.run_id
+        else common.OUTPUT_DIR
+    )
+    os.makedirs(output_dir, exist_ok=True)
 
     results = [
         common.run_hpo_for_env(
             ALGO,
             env_id,
             args.trials,
-            common.OUTPUT_DIR,
+            output_dir,
             gpus,
             n_jobs,
             param_suggester=suggest_params,
@@ -115,7 +125,7 @@ def main() -> None:
         )
         for env_id in envs
     ]
-    summary_path = os.path.join(common.OUTPUT_DIR, 'wcsac_iqn_hpo_summary.yaml')
+    summary_path = os.path.join(output_dir, 'wcsac_iqn_hpo_summary.yaml')
     with open(summary_path, 'w', encoding='utf-8') as file:
         yaml.safe_dump(results, file, allow_unicode=True, sort_keys=False)
     print(f'WCSAC-IQN HPO 完成，结果保存到 {summary_path}')
