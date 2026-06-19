@@ -13,7 +13,9 @@ WCSAC / WCSAC_IQN 超参数自动搜索（Optuna）。
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable
 
 import numpy as np
@@ -200,6 +202,36 @@ def run_single_seed(
     return float(reward), float(cost)
 
 
+def _run_seed_job(
+    job: tuple[str, str, dict[str, Any], str, int, int | None],
+) -> tuple[int, float, float]:
+    """Run one seed in a child process."""
+    algo, env_id, params, log_dir, seed, gpu_id = job
+    reward, cost = run_single_seed(algo, env_id, params, log_dir, seed, gpu_id)
+    return seed, reward, cost
+
+
+def _select_seed_gpus(
+    trial_number: int,
+    gpus: list[int],
+    seed_workers: int,
+    max_parallel_trials: int,
+) -> list[int | None]:
+    """Assign one GPU per seed while keeping concurrent trials disjoint."""
+    if not gpus:
+        return [None for _ in SEEDS]
+    if seed_workers <= 1:
+        return [gpus[trial_number % len(gpus)] for _ in SEEDS]
+
+    max_parallel_trials = max(max_parallel_trials, 1)
+    trial_slot = trial_number % max_parallel_trials
+    start = trial_slot * seed_workers
+    gpu_chunk = gpus[start:start + seed_workers]
+    if not gpu_chunk:
+        gpu_chunk = gpus[:seed_workers]
+    return [gpu_chunk[idx % len(gpu_chunk)] for idx, _seed in enumerate(SEEDS)]
+
+
 def objective(
     trial: 'optuna.Trial',
     algo: str,
@@ -207,6 +239,8 @@ def objective(
     base_log_dir: str,
     gpus: list[int],
     param_suggester: Callable[[Any], dict[str, Any]] | None = None,
+    seed_workers: int = 1,
+    max_parallel_trials: int = 1,
 ) -> float:
     """目标函数：3 个种子取平均，cost 超标时给惩罚。"""
     params = (
@@ -215,25 +249,61 @@ def objective(
         else suggest_params(trial, algo)
     )
 
-    # 按 trial 编号轮询分配 GPU
-    gpu_id = gpus[trial.number % len(gpus)] if gpus else None
-
     # TensorBoard 只用 trial 和 seed 区分运行，参数保留在 Optuna 中。
     trial_dir = _build_trial_name(trial.number)
+    seed_gpus = _select_seed_gpus(
+        trial.number,
+        gpus,
+        seed_workers,
+        max_parallel_trials,
+    )
 
     rewards = []
     costs = []
 
-    for seed in SEEDS:
-        log_dir = os.path.join(base_log_dir, trial_dir, f'seed_{seed:03d}')
-        try:
-            reward, cost = run_single_seed(algo, env_id, params, log_dir, seed, gpu_id)
-            rewards.append(reward)
-            costs.append(cost)
-        except Exception as exc:
-            print(f'[Trial {trial.number}] seed={seed} 异常: {exc}')
-            rewards.append(-1e6)
-            costs.append(1e6)
+    jobs = [
+        (
+            algo,
+            env_id,
+            params,
+            os.path.join(base_log_dir, trial_dir, f'seed_{seed:03d}'),
+            seed,
+            seed_gpus[idx],
+        )
+        for idx, seed in enumerate(SEEDS)
+    ]
+    seed_workers = max(1, min(seed_workers, len(SEEDS)))
+    if seed_workers == 1:
+        for job in jobs:
+            seed = job[4]
+            try:
+                _seed, reward, cost = _run_seed_job(job)
+                rewards.append(reward)
+                costs.append(cost)
+            except Exception as exc:
+                print(f'[Trial {trial.number}] seed={seed} 异常: {exc}')
+                rewards.append(-1e6)
+                costs.append(1e6)
+    else:
+        context = mp.get_context('spawn')
+        with ProcessPoolExecutor(
+            max_workers=seed_workers,
+            mp_context=context,
+        ) as executor:
+            futures = {executor.submit(_run_seed_job, job): job[4] for job in jobs}
+            results: dict[int, tuple[float, float]] = {}
+            for future in as_completed(futures):
+                seed = futures[future]
+                try:
+                    _seed, reward, cost = future.result()
+                    results[_seed] = (reward, cost)
+                except Exception as exc:
+                    print(f'[Trial {trial.number}] seed={seed} 异常: {exc}')
+                    results[seed] = (-1e6, 1e6)
+            for seed in SEEDS:
+                reward, cost = results[seed]
+                rewards.append(reward)
+                costs.append(cost)
 
     mean_reward = float(np.mean(rewards))
     mean_cost = float(np.mean(costs))
@@ -277,6 +347,7 @@ def run_hpo_for_env(
     gpus: list[int],
     n_jobs: int,
     param_suggester: Callable[[Any], dict[str, Any]] | None = None,
+    seed_workers: int = 1,
 ) -> dict[str, Any]:
     """对单个 (algo, env_id) 组合运行 HPO。"""
     import optuna
@@ -287,7 +358,7 @@ def run_hpo_for_env(
     print(f'\n{"=" * 60}')
     print(f'启动 HPO: {study_name}')
     print(f'Trials: {n_trials}  |  步数: {TOTAL_STEPS:,}  |  Seeds: {SEEDS}')
-    print(f'GPU: {gpus}  |  并行: {n_jobs} jobs')
+    print(f'GPU: {gpus}  |  并行 trial: {n_jobs}  |  seed workers: {seed_workers}')
     print(
         '搜索参数: learning_rate, batch_size, polyak, '
         'cost_penalty_lr_scale, multiplier_init',
@@ -313,6 +384,8 @@ def run_hpo_for_env(
             base_log_dir,
             gpus,
             param_suggester,
+            seed_workers,
+            n_jobs,
         ),
         n_trials=n_trials,
         n_jobs=n_jobs,

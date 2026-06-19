@@ -10,7 +10,10 @@ from typing import Any
 import torch
 import yaml
 
-from hpo import run_wcsac_hpo as common
+try:
+    from hpo import run_wcsac_hpo as common
+except ModuleNotFoundError:
+    import run_wcsac_hpo as common
 
 
 ALGO = 'WCSAC'
@@ -43,10 +46,10 @@ def suggest_params(trial: 'optuna.Trial') -> dict[str, Any]:
     }
 
 
-def _resolve_devices(args: argparse.Namespace) -> tuple[list[int], int]:
+def _resolve_devices(args: argparse.Namespace) -> tuple[list[int], int, int]:
     """Resolve available GPUs and Optuna worker count."""
     if args.cpu:
-        return [], 1
+        return [], 1, 1
 
     available = set(range(torch.cuda.device_count()))
     requested = (
@@ -57,9 +60,18 @@ def _resolve_devices(args: argparse.Namespace) -> tuple[list[int], int]:
     gpus = [gpu for gpu in requested if gpu in available]
     if not gpus:
         print('未检测到可用 GPU，自动回退到 CPU。')
-        return [], 1
-    n_jobs = args.parallel if args.parallel else min(common.N_JOBS, len(gpus))
-    return gpus, n_jobs
+        return [], 1, 1
+
+    seed_workers = min(max(args.seed_workers, 1), len(common.SEEDS), len(gpus))
+    max_trial_jobs = max(len(gpus) // seed_workers, 1)
+    requested_jobs = args.parallel if args.parallel else min(common.N_JOBS, max_trial_jobs)
+    n_jobs = min(requested_jobs, max_trial_jobs)
+    if requested_jobs != n_jobs:
+        print(
+            f'每个 trial 并行 {seed_workers} 个 seed，'
+            f'{len(gpus)} 张 GPU 最多同时跑 {n_jobs} 个 trial。',
+        )
+    return gpus, n_jobs, seed_workers
 
 
 def main() -> None:
@@ -69,11 +81,12 @@ def main() -> None:
     parser.add_argument('--trials', type=int, default=common.N_TRIALS)
     parser.add_argument('--gpus', default=None, help='GPU 编号，逗号分隔')
     parser.add_argument('--parallel', type=int, default=None)
+    parser.add_argument('--seed-workers', type=int, default=len(common.SEEDS))
     parser.add_argument('--cpu', action='store_true')
     args = parser.parse_args()
 
     envs = [env.strip() for env in args.env.split(',')]
-    gpus, n_jobs = _resolve_devices(args)
+    gpus, n_jobs, seed_workers = _resolve_devices(args)
     os.makedirs(common.OUTPUT_DIR, exist_ok=True)
 
     results = [
@@ -85,6 +98,7 @@ def main() -> None:
             gpus,
             n_jobs,
             param_suggester=suggest_params,
+            seed_workers=seed_workers,
         )
         for env_id in envs
     ]

@@ -52,6 +52,13 @@ def test_hpo_tensorboard_names_only_include_trial_and_seed() -> None:
     assert run_wcsac_metadrive_hpo._build_trial_name(12) == 'trial_012'
 
 
+def test_hpo_parallel_seed_gpu_assignment_uses_disjoint_chunks() -> None:
+    assert run_wcsac_hpo._select_seed_gpus(0, list(range(8)), 3, 2) == [0, 1, 2]
+    assert run_wcsac_hpo._select_seed_gpus(1, list(range(8)), 3, 2) == [3, 4, 5]
+    assert run_wcsac_hpo._select_seed_gpus(2, list(range(8)), 3, 2) == [0, 1, 2]
+    assert run_wcsac_hpo._select_seed_gpus(3, [7], 1, 1) == [7, 7, 7]
+
+
 def test_gaussian_and_iqn_use_separate_search_spaces() -> None:
     gaussian = run_wcsac_gaussian_hpo.suggest_params(FakeTrial())
     iqn = run_wcsac_iqn_hpo.suggest_params(FakeTrial())
