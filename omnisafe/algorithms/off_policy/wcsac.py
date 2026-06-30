@@ -54,7 +54,7 @@ class WCSAC(SAC):
     _alpha_optimizer: optim.Optimizer
     _pdf_cdf: float  # CVaR 系数: phi(Phi^{-1}(alpha)) / (1 - alpha)
     _cost_constraint: float
-    _damp: float  # 阻尼项, 基于 real actions 的 CVaR 与 cost_limit 的差值
+    _damp: float  # 单向阻尼项 (>=0), 仅在 CVaR 超过 cost_constraint 时加罚
 
     def _init_model(self) -> None:
         """Initialize the model.
@@ -121,11 +121,24 @@ class WCSAC(SAC):
         gamma = float(self._cfgs.algo_cfgs.gamma)
         if gamma == 1.0:
             raise ValueError('WCSAC cost-limit conversion requires gamma < 1')
+        # 将 episodic undiscounted cost_limit 转换为与 buffer 平均 qc 同尺度的约束值。
+        # 原始公式 cost_limit * (1-γ^T)/(1-γ) / T 得到的是 episode 起点的 Q_c (V(0)),
+        # 但 beta_loss 拿它和 replay buffer 中随机时刻 Q_c 的全 episode 平均比较。
+        # 在 "每步成本均匀 = cost_limit/T" 假设下:
+        #   V(t) = c*(1-γ^(T-t))/(1-γ),  V(0) = c*(1-γ^T)/(1-γ),  c = cost_limit/T
+        #   avg = (1/T) Σ_t V(t) = c*[T - γ(1-γ^T)/(1-γ)] / [T(1-γ)]
+        #   avg_factor = avg / V(0) = [T - γ(1-γ^T)/(1-γ)] / [T(1-γ^T)]
+        # γ=0.99,T=1000 时 avg_factor ≈ 0.901, 即阈值原本偏高 ~10%, 会导致
+        # "恰好满足约束时 beta 仍持续衰减" 的系统偏差. (对非均匀成本为近似, 但严格优于原实现.)
+        discounted_sum = (1.0 - gamma**max_ep_len) / (1.0 - gamma)
+        avg_factor = (max_ep_len - gamma * discounted_sum) / (
+            max_ep_len * (1.0 - gamma**max_ep_len)
+        )
         self._cost_constraint = (
             float(self._cfgs.lagrange_cfgs.cost_limit)
-            * (1.0 - gamma**max_ep_len)
-            / (1.0 - gamma)
+            * discounted_sum
             / max_ep_len
+            * avg_factor
         )
         self._damp = 0.0
 
@@ -186,6 +199,10 @@ class WCSAC(SAC):
             else self._actor_critic.cost_var_critic
         )
         mu = mean_critic(obs, act)[0].unsqueeze(-1)
+        # cost 是非负量, 钳到 >= 0 防止 critic 训练早期漂负.
+        # 若 mu < 0, cvar = mu + sigma*pdf_cdf 可能 < 0 < cost_constraint,
+        # beta_loss 会把 beta 一路压到 0, 与真实成本是否超限无关.
+        mu = torch.clamp(mu, min=0.0)
         var = F.softplus(var_critic(obs, act)[0]).unsqueeze(-1)
         var = torch.clamp(var, min=1e-8, max=1e8)
         return mu, var
@@ -344,10 +361,15 @@ class WCSAC(SAC):
         # L_var = 0.5 * E[var + target_var - 2 * sqrt(var * target_var)]
         loss_var = 0.5 * (var + target_var - 2 * torch.sqrt(var * target_var)).mean()
 
-        # 计算阻尼项 (基于 real actions 的 CVaR 与 cost_limit 的差值)
+        # 阻尼项: 单向, 只在 CVaR 超过阈值时加罚, 不在 CVaR 低于阈值时减罚.
+        # 原始双向 damp = damp_scale*(thresh - cvar) 在 critic 低估时会令 (beta - damp) < 0,
+        # actor loss 反向激励增加 cost (正反馈导致 beta 崩塌). 单向化后 effective penalty
+        # = beta + damp >= beta >= 0 始终成立, "低位放松" 交回给 beta_loss 慢调节.
         damp_scale = float(self._cfgs.algo_cfgs.get('damp_scale', 10.0))
         cvar_real = self._gaussian_cvar(mu.detach(), var.detach())
-        self._damp = damp_scale * (self._cost_constraint - cvar_real.mean()).item()
+        self._damp = damp_scale * torch.clamp(
+            cvar_real.mean() - self._cost_constraint, min=0.0
+        ).item()
 
         loss = loss_mu + loss_var
 
@@ -387,9 +409,11 @@ class WCSAC(SAC):
     def _loss_pi(self, obs: torch.Tensor) -> torch.Tensor:
         r"""Compute actor loss for WCSAC.
 
-        L = E[ α * log π(a|s) - min(Q1^r, Q2^r)(s,a) + λ * CVaR(s,a) ]
+        L = E[ α * log π(a|s) - min(Q1^r, Q2^r)(s,a) + (λ + damp) * CVaR(s,a) ]
 
-        where CVaR = mu + sigma * pdf_cdf for Gaussian distribution.
+        where CVaR = mu + sigma * pdf_cdf for Gaussian distribution, and ``damp`` is a
+        one-sided (>=0) proportional boost that only activates when CVaR exceeds the
+        cost constraint, so the effective penalty never drops below ``λ``.
         """
         action = self._actor_critic.actor.predict(obs, deterministic=False)
         log_prob = self._actor_critic.actor.log_prob(action)
@@ -407,8 +431,10 @@ class WCSAC(SAC):
                 cvar = self._gaussian_cvar(mu, var)
 
                 if torch.isfinite(cvar).all():
+                    # damp >= 0 (单向), 故 effective penalty = λ + damp >= λ >= 0,
+                    # 永不会反向激励 actor 增加 cost.
                     loss_cost = (
-                        self._lagrange_multiplier.detach() - self._damp
+                        self._lagrange_multiplier.detach() + self._damp
                     ) * cvar.squeeze(-1)
 
         total_loss = (loss_entropy + loss_reward + loss_cost).mean()
