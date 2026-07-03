@@ -435,7 +435,7 @@ def main() -> None:
         '--cost-limit',
         type=float,
         default=None,
-        help=f'cost 约束阈值（默认 {COST_LIMIT}）',
+        help='cost 约束阈值（默认见 COST_LIMIT，模块顶部）',
     )
     args = parser.parse_args()
 
