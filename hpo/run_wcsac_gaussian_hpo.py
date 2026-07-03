@@ -88,7 +88,16 @@ def main() -> None:
         default=None,
         help='运行标识，传入后结果存到 OUTPUT_DIR/<run-id>/ 子目录，与历史运行隔离',
     )
+    parser.add_argument(
+        '--cost-limit',
+        type=float,
+        default=None,
+        help=f'cost 约束阈值（默认 {common.COST_LIMIT}）',
+    )
     args = parser.parse_args()
+
+    if args.cost_limit is not None:
+        common.COST_LIMIT = args.cost_limit
 
     envs = [env.strip() for env in args.env.split(',')]
     gpus, n_jobs, seed_workers = _resolve_devices(args)

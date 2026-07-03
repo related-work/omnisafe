@@ -431,7 +431,17 @@ def main() -> None:
         default=None,
         help='运行标识，传入后结果存到 OUTPUT_DIR/<run-id>/ 子目录，与历史运行隔离',
     )
+    parser.add_argument(
+        '--cost-limit',
+        type=float,
+        default=None,
+        help=f'cost 约束阈值（默认 {COST_LIMIT}）',
+    )
     args = parser.parse_args()
+
+    if args.cost_limit is not None:
+        global COST_LIMIT
+        COST_LIMIT = args.cost_limit
 
     algos = [a.strip() for a in args.algo.split(',')] if args.algo else ALGOS
     envs = [e.strip() for e in args.env.split(',')] if args.env else ENV_IDS
